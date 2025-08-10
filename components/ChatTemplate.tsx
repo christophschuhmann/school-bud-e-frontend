@@ -147,7 +147,7 @@ function ChatTemplate(
     <div
       class={messages?.length === 0
         ? `bg-transparent`
-        : `chat-history flex flex-col space-y-4 p-4 mx-auto rounded-lg shadow bg-white/75`}
+        : `chat-history flex flex-col space-y-4 p-4 mx-auto rounded-lg shadow bg-white/75 max-h-[60vh] overflow-y-auto`}
     >
       <button
         class={`absolute top-0 left-0 m-4 text-xs align-middle text-gray-600 hover:text-gray-800 transition-colors`}

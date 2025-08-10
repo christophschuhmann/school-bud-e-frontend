@@ -1,77 +1,92 @@
 import { Handlers } from "$fresh/server.ts";
 
-const WIKIPEDIA_API_URL = "http://37.27.128.150:9999/search";
+// Definiert die Struktur der erwarteten Wikipedia-Suchergebnisse
+interface WikipediaSearchResult {
+  title: string;
+  pageid: number;
+}
 
-function getErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
+// Definiert die Struktur der Seitendaten, die wir erhalten
+interface WikipediaPage {
+  pageid: number;
+  title: string;
+  extract: string;
 }
 
 export const handler: Handlers = {
-  async GET(req: Request) {
-    try {
-      const url = new URL(req.url);
-      const text = url.searchParams.get("text");
-      const collection = url.searchParams.get("collection") || "English-ConcatX-Abstract";
-      const n = parseInt(url.searchParams.get("n") || "2", 10);
-
-      if (!text) {
-        throw new Error("Text parameter is required");
-      }
-
-      const response = await fetch(WIKIPEDIA_API_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, collection, n }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const data = await response.json();
-      return new Response(JSON.stringify(data), {
-        headers: { "Content-Type": "application/json" },
-      });
-    } catch (error) {
-      console.error("Error in wikipedia API:", error);
-      return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-  },
-
   async POST(req: Request) {
     try {
-      const payload = await req.json();
-      if (!payload.text) {
-        throw new Error("Text parameter is required");
+      const { text, collection, n = 5 } = await req.json();
+
+      if (!text) {
+        return new Response(JSON.stringify({ error: "Text parameter is required" }), { status: 400 });
       }
 
-      console.log("Payload:", payload);
+      // Bestimme die Sprache basierend auf der 'collection'-Variable (für Abwärtskompatibilität)
+      const lang = collection === "German-ConcatX-Abstract" ? "de" : "en";
+      const WIKIPEDIA_API_URL = `https://${lang}.wikipedia.org/w/api.php`;
 
-      const response = await fetch(WIKIPEDIA_API_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: payload.text,
-          collection: payload.collection || "English-ConcatX-Abstract",
-          n: payload.n || 2,
-        }),
-      });
+      // --- SCHRITT 1: Suche nach dem Begriff, um die besten Seitentitel zu finden ---
+      const searchUrl = new URL(WIKIPEDIA_API_URL);
+      searchUrl.searchParams.set("action", "query");
+      searchUrl.searchParams.set("list", "search");
+      searchUrl.searchParams.set("srsearch", text);
+      searchUrl.searchParams.set("srlimit", String(n)); // Limitiere die Anzahl der Suchergebnisse
+      searchUrl.searchParams.set("format", "json");
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+      const searchResponse = await fetch(searchUrl);
+      if (!searchResponse.ok) {
+        throw new Error(`Wikipedia search API error! status: ${searchResponse.status}`);
+      }
+      const searchData = await searchResponse.json();
+      
+      const searchResults: WikipediaSearchResult[] = searchData.query?.search;
+
+      if (!searchResults || searchResults.length === 0) {
+        return new Response(JSON.stringify([]), {
+          headers: { "Content-Type": "application/json" },
+        });
       }
 
-      const data = await response.json();
-      return new Response(JSON.stringify(data), {
+      // Sammle die Titel der besten Suchergebnisse
+      const titles = searchResults.map(result => result.title).join("|");
+
+      // --- SCHRITT 2: Hole die Zusammenfassungen (extracts) für die gefundenen Titel ---
+      const extractUrl = new URL(WIKIPEDIA_API_URL);
+      extractUrl.searchParams.set("action", "query");
+      extractUrl.searchParams.set("prop", "extracts");
+      extractUrl.searchParams.set("titles", titles);
+      extractUrl.searchParams.set("exintro", "true");      // Nur die Einleitung
+      extractUrl.searchParams.set("explaintext", "true"); // Als reinen Text, nicht HTML
+      extractUrl.searchParams.set("format", "json");
+      extractUrl.searchParams.set("redirects", "1"); // Folgt Weiterleitungen automatisch
+
+      const extractResponse = await fetch(extractUrl);
+      if (!extractResponse.ok) {
+        throw new Error(`Wikipedia extract API error! status: ${extractResponse.status}`);
+      }
+      const extractData = await extractResponse.json();
+      const pages: Record<string, WikipediaPage> = extractData.query?.pages;
+
+      // --- SCHRITT 3: Formatiere die Ergebnisse für das Frontend ---
+      const formattedResults = Object.values(pages).map(page => {
+        // Erzeuge die URL zur Wikipedia-Seite
+        const pageUrl = `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(page.title)}`;
+        return {
+          Title: page.title,
+          URL: pageUrl,
+          content: page.extract || "Keine Zusammenfassung verfügbar.", // Fallback
+          score: "N/A" // Die offizielle API liefert keinen Score
+        };
+      });
+
+      return new Response(JSON.stringify(formattedResults), {
         headers: { "Content-Type": "application/json" },
       });
+
     } catch (error) {
-      console.error("Error in wikipedia API:", error);
-      return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
+      console.error("Error in Wikipedia API handler:", error);
+      return new Response(JSON.stringify({ error: error.message }), {
         status: 500,
         headers: { "Content-Type": "application/json" },
       });

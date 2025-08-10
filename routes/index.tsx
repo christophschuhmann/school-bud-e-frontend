@@ -19,7 +19,7 @@ export default function Home(req: Request) {
         height: "100vh", // Ensure full screen height
       }}
     >
-      <div class="max-w-screen-md mx-auto flex flex-col items-center justify-center">
+      <div class="w-4/5 mx-auto flex flex-col items-center justify-center">
         <Header lang={lang as string} />
         <ChatAgreementOrIsland lang={lang as string} />
       </div>

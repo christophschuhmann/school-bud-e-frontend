@@ -57,7 +57,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
 
   // General settings
   const [readAlways, setReadAlways] = useState(false);
-  const [autoScroll, setAutoScroll] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
   const [images, setImages] = useState([] as Image[]);
   const [isStreamComplete, setIsStreamComplete] = useState(true);
   const [stopList, setStopList] = useState([] as number[]);
@@ -223,16 +223,13 @@ export default function ChatIsland({ lang }: { lang: string }) {
   // 3. useEffect [messages]
   useEffect(() => {
     if (autoScroll) {
-      // Only proceed if we're not already scrolling
-      const currentPosition = globalThis.innerHeight +
-        globalThis.scrollY;
-      const totalScrollHeight = document.body.scrollHeight;
-
-      // Only scroll if the deviation is more than 100 pixels
-      if (totalScrollHeight - currentPosition > 500) {
-        globalThis.scrollTo({
-          top: totalScrollHeight,
-          behavior: "smooth",
+      // Find the scrollable chat container element we created earlier
+      const chatContainer = document.querySelector('.chat-history');
+      if (chatContainer) {
+        // Scroll the container smoothly to the bottom to show the newest message
+        chatContainer.scrollTo({
+          top: chatContainer.scrollHeight,
+          behavior: 'smooth',
         });
       }
     }
@@ -608,7 +605,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
   // 2.1 readAlways is true and new stream comes in or
   // 2.2 the loudspeaker button is clicked in chatTemplate to play groupIndex
   //     (handleOnSpeakAtGroupIndex)
-
   // 1. startStream
   const startStream = async (transcript: string, prevMessages?: Message[]) => {
     // if currentEditIndex is set, we are editing a message instead of starting the stream
@@ -638,7 +634,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
     setAudioFileDict({ ...audioFileDict });
     const ongoingStream: string[] = [];
     let currentAudioIndex = 1;
-    let ttsFromFirstSentence = false;
     if (isStreamComplete) {
       setIsStreamComplete(false);
       setResetTranscript(resetTranscript + 1);
@@ -709,22 +704,20 @@ export default function ChatIsland({ lang }: { lang: string }) {
 
         const res = await fetchWikipedia(query, collection, n);
 
-        // console.log("[API] wikipedia response", res);
-
         const beautifulWikipedia = res!.map(
           (result: WikipediaResult, index: number) => {
-            const content = Object.values(result)[0];
+            // const content = Object.values(result)[0]; // Diese Zeile wird nicht mehr benötigt
             return `**${chatIslandContent[lang].result} ${index + 1} ${
               chatIslandContent[lang].of
             } ${res!.length}**\n**${
               chatIslandContent[lang].wikipediaTitle
-            }**: ${content.Title}\n**${
+            }**: ${result.Title}\n**${
               chatIslandContent[lang].wikipediaURL
-            }**: ${content.URL}\n**${
+            }**: ${result.URL}\n**${
               chatIslandContent[lang].wikipediaContent
-            }**: ${content["Concat Abstract"]}\n**${
+            }**: ${result.content}\n**${ // <-- GEÄNDERTE ZEILE
               chatIslandContent[lang].wikipediaScore
-            }**: ${content.score}\n`;
+            }**: ${result.score}\n`;
           },
         ).join("\n\n");
 
@@ -751,8 +744,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
         }
 
         const response = await fetchPapers(query, limit);
-
-        // console.log("[API] papers response", response);
 
         const beautifulPapers = response!.payload.items.map(
           (result: PapersItem, index: number) => {
@@ -794,12 +785,8 @@ export default function ChatIsland({ lang }: { lang: string }) {
           top_n = parseInt(currentQuerry.split(":")[2].trim(), 10);
         }
 
-        // console.log("query", query);
-        // console.log("top_n", top_n);
-
         const res = await fetchBildungsplan(query, top_n);
 
-        // console.log("[API] bildungsplan response", res);
         const beautifulBildungsplan = res!.results.map((result, index) => {
           return `**${chatIslandContent[lang].result} ${index + 1} ${
             chatIslandContent[lang].of
@@ -840,61 +827,44 @@ export default function ChatIsland({ lang }: { lang: string }) {
           vlmCorrectionModel: settings.vlmCorrectionModel,
           systemPrompt: settings.systemPrompt,
         }),
+        // ### START OF UPDATED BLOCK ###
         onmessage(ev: EventSourceMessage) {
           const parsedData = JSON.parse(ev.data);
-          console.warn("parsedData", parsedData);
           ongoingStream.push(parsedData);
-          if (ttsFromFirstSentence === false) {
-            const combinedText = ongoingStream.join("");
-            // Find last occurrence of .!? that's not after a digit
-            const match = combinedText.match(/(?<!\d)[.!?][^.!?]*$/);
+          const combinedText = ongoingStream.join("");
 
-            if (match && combinedText.length > 20) {
-              const splitIndex = match.index! + 1; // Include the punctuation
-              const textToSpeak = combinedText.slice(0, splitIndex);
-              const remaining = combinedText.slice(splitIndex);
+          // We look for the last sentence ending (. ! ?) that is not preceded by a digit
+          const sentenceEndRegex = /(?<!\d)[.!?]/g;
+          let match;
+          let lastMatchIndex = -1;
 
-              if (textToSpeak.trim() !== "") {
-                getTTS(
-                  textToSpeak,
-                  newMessages.length - 1,
-                  `stream${currentAudioIndex}`,
-                );
+          // Find the last match in the combined text
+          while ((match = sentenceEndRegex.exec(combinedText)) !== null) {
+            lastMatchIndex = match.index;
+          }
 
-                currentAudioIndex++;
-                ongoingStream.length = 0; // Clear array
-                if (remaining.trim()) {
-                  ongoingStream.push(remaining); // Push remaining text
-                }
-                ttsFromFirstSentence = true;
-              }
-            }
-          } else {
-            // check for \n\n in the parsedData, e.g., ' \n\n', or '\n\n ' etc.
-            const combinedText = ongoingStream.join("");
-            if (
-              /\n\n/.test(combinedText.slice(5)) && combinedText.length > 15
-            ) {
-              console.log(JSON.stringify(combinedText));
-              const paragraphSplit = combinedText.split(/\n\n/);
-              // console.warn("paragraphSplit", paragraphSplit)
-              const textToSpeak = paragraphSplit.slice(0, -1).join("\n\n");
+          // If a sentence ending is found, process it
+          if (lastMatchIndex !== -1) {
+            const splitIndex = lastMatchIndex + 1;
+            const textToSpeak = combinedText.slice(0, splitIndex);
+            const remaining = combinedText.slice(splitIndex);
 
-              const remaining = paragraphSplit[paragraphSplit.length - 1];
-
+            if (textToSpeak.trim() !== "") {
               getTTS(
                 textToSpeak,
-                newMessages.length - 1,
+                newMessages.length,
                 `stream${currentAudioIndex}`,
               );
 
               currentAudioIndex++;
-              ongoingStream.length = 0;
+              ongoingStream.length = 0; // Clear the buffer
               if (remaining.trim()) {
-                ongoingStream.push(remaining);
+                ongoingStream.push(remaining); // Add the start of the next sentence back to the buffer
               }
             }
           }
+
+          // Update the UI with the latest text chunk immediately
           setMessages((prevMessagesRoundTwo) => {
             const lastArray =
               prevMessagesRoundTwo[prevMessagesRoundTwo.length - 1];
@@ -905,11 +875,11 @@ export default function ChatIsland({ lang }: { lang: string }) {
             ];
           });
         },
+        // ### END OF UPDATED BLOCK ###
         async onopen(response: Response) {
           const prevMessagesRoundTwo = newMessages;
           prevMessagesRoundTwo.push({ "role": "assistant", "content": [] });
           setMessages((prevMessagesRoundTwo) => prevMessagesRoundTwo);
-          await true;
           if (response.ok) {
             return; // everything's good
           } else if (
@@ -942,17 +912,20 @@ export default function ChatIsland({ lang }: { lang: string }) {
           console.log("Stream closed");
           setIsStreamComplete(true);
           setQuery("");
-          getTTS(
-            ongoingStream.join(""),
-            newMessages.length - 1,
-            `stream${currentAudioIndex}`,
-          );
-          console.log("ONGOING STREAM: ", ongoingStream);
+          // Send any remaining text in the buffer to TTS
+          const remainingText = ongoingStream.join("").trim();
+          if (remainingText) {
+            getTTS(
+              remainingText,
+              newMessages.length,
+              `stream${currentAudioIndex}`,
+            );
+          }
+          console.log("ONGOING STREAM (at close): ", remainingText);
         },
       });
     }
   };
-
   // 2. getTTS
   const getTTS = async (
     text: string,
