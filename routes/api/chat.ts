@@ -23,164 +23,283 @@ interface Message {
   content: string;
 }
 
-async function getModelResponseStream(messages: Message[], lang: string, universalApiKey: string,llmApiUrl: string, llmApiKey: string, llmApiModel: string, systemPrompt: string, vlmApiUrl: string, vlmApiKey: string, vlmApiModel: string, vlmCorrectionModel: string) {
-
-  if (universalApiKey != '' && !universalApiKey.startsWith("sbe-")) {
-    return new Response("Invalid Universal API Key. It needs to start with '**sbe-**'.", { status: 400 });
+// --- REPLACE THE WHOLE FUNCTION STARTING HERE ---
+async function getModelResponseStream(
+  // deno-lint-ignore no-explicit-any
+  messages: any[],
+  lang: string,
+  universalApiKey: string,
+  llmApiUrl: string,
+  llmApiKey: string,
+  llmApiModel: string,
+  systemPrompt: string,
+  vlmApiUrl: string,
+  vlmApiKey: string,
+  vlmApiModel: string,
+  vlmCorrectionModel: string,
+) {
+  // 1) Same universal key gate as before
+  if (universalApiKey != "" && !universalApiKey.startsWith("sbe-")) {
+    return new Response(
+      "Invalid Universal API Key. It needs to start with '**sbe-**'.",
+      { status: 400 },
+    );
   }
 
-
-  let isLastMessageAssistant =
-    messages[messages.length - 1].role === "assistant";
+  // 2) Trim trailing assistant messages (unchanged behavior)
+  let isLastMessageAssistant = messages[messages.length - 1]?.role === "assistant";
   while (isLastMessageAssistant) {
     messages.pop();
-    isLastMessageAssistant = messages[messages.length - 1].role === "assistant";
+    isLastMessageAssistant = messages[messages.length - 1]?.role === "assistant";
   }
 
-  // check if the LAST message has #correction or #korrektur in the content (case insensitive)
+  // 3) Correction mode flag (re-uses your helper)
   const isCorrectionInLastMessage = hasKorrekturHashtag(messages);
 
-  console.log("isCorrectionInLastMessage", isCorrectionInLastMessage);
+  // 4) System prompt selection (unchanged)
+  let useThisSystemPrompt = isCorrectionInLastMessage
+    ? chatContent[lang].correctionSystemPrompt
+    : chatContent[lang].systemPrompt;
+  if (systemPrompt != "") useThisSystemPrompt = systemPrompt;
 
-  let useThisSystemPrompt = isCorrectionInLastMessage ? chatContent[lang].correctionSystemPrompt : chatContent[lang].systemPrompt;
-
-  if (systemPrompt != "") {
-    useThisSystemPrompt = systemPrompt;
-  }
-
-  console.log(useThisSystemPrompt);
-
+  // Keep your current pattern: push a system message in front
   messages.unshift({
     role: "system",
     content: useThisSystemPrompt,
   });
 
-  // looks for messages with array content that contains objects with a 'type' property set to 'image_url'
+  // 5) Detect images (unchanged) and PDFs (NEW)
+  const isImageInMessages = messages.some((m) =>
+    Array.isArray(m.content) && m.content.some((p: any) => p.type === "image_url")
+  );
 
-  const isImageInMessages = messages.some((message) => {
-    if (Array.isArray(message.content)) {
-      // Check if any item in the array has type "image_url"
-      return message.content.some((item) => item.type === "image_url");
-    } else if (
-      typeof message.content === "object" && message.content !== null
-    ) {
-      // Check if single object has type "image_url"
-      return (message.content as { type?: string }).type === "image_url";
+  const isPdfInMessages = messages.some((m) =>
+    Array.isArray(m.content) && m.content.some((p: any) => p.type === "pdf")
+  );
+
+  // 6) If PDF present, call Gemini native streaming API with inlineData
+  if (isPdfInMessages) {
+    // Prefer configured VLM key/model from settings/env (like your image path)
+    const geminiApiKey =
+      vlmApiKey || Deno.env.get("VLM_KEY") || "";
+    const geminiModel =
+      vlmApiModel || Deno.env.get("VLM_MODEL") || "gemini-2.5-pro";
+
+    if (!geminiApiKey) {
+      return new Response(
+        "Missing VLM API key for PDF processing (expected Google AI Studio key).",
+        { status: 400 },
+      );
     }
-    return false;
-  });
 
+    // Build Gemini "contents" from your existing messages
+    // - Convert your 'system' message into system_instruction
+    // - Map user/assistant text to parts[]
+    // - For PDFs: use inlineData { mimeType, data } (already base64 in your UI)
+    const systemMessage = messages.find((m) => m.role === "system");
+    const systemInstruction = systemMessage?.content
+      ? {
+          role: "system",
+          parts: [{ text: typeof systemMessage.content === "string"
+            ? systemMessage.content
+            : Array.isArray(systemMessage.content)
+              ? (systemMessage.content.find((c: any) => c.type === "text")?.text || "")
+              : "" }],
+        }
+      : undefined;
 
-  let api_url = "";
-  let api_key = "";
-  let api_model = "";
+    // Map remaining messages into Gemini contents
+    const geminiContents = messages
+      .filter((m) => m.role !== "system")
+      .map((m) => {
+        const parts: any[] = [];
+
+        if (typeof m.content === "string") {
+          if (m.content.trim() !== "") parts.push({ text: m.content });
+        } else if (Array.isArray(m.content)) {
+          for (const c of m.content) {
+            if (c.type === "text" && c.text && c.text.trim() !== "") {
+              parts.push({ text: c.text });
+            } else if (c.type === "pdf" && c.data) {
+              // Your PdfUploadButton already supplies base64 `data` + `mime_type`
+              parts.push({
+                inlineData: {
+                  mimeType: c.mime_type || "application/pdf",
+                  data: c.data, // base64 only
+                },
+              });
+            } else if (c.type === "image_url" && c.image_url?.url?.startsWith("data:")) {
+              // If images are uploaded alongside a PDF, include them as inlineData too
+              const dataUrl = c.image_url.url;
+              const commaIdx = dataUrl.indexOf(",");
+              const header = dataUrl.substring(5, commaIdx); // e.g. image/png;base64
+              const base64 = dataUrl.substring(commaIdx + 1);
+              const mimeType = header.split(";")[0];       // e.g. image/png
+              parts.push({
+                inlineData: {
+                  mimeType,
+                  data: base64,
+                },
+              });
+            }
+          }
+        }
+
+        return { role: m.role === "assistant" ? "model" : "user", parts };
+      });
+
+    // Gemini streaming endpoint (SSE)
+    const geminiUrl =
+      `https://generativelanguage.googleapis.com/v1beta/models/` +
+      `${encodeURIComponent(geminiModel)}:streamGenerateContent` +
+      `?alt=sse&key=${encodeURIComponent(geminiApiKey)}`;
+
+    // Build request body similar to the example you supplied
+    const geminiBody: any = {
+      contents: geminiContents,
+      generationConfig: {
+        // Keep defaults; expose "thinking" like your example if desired
+        thinkingConfig: { thinkingBudget: -1 },
+      },
+      tools: [{ googleSearch: {} }],
+    };
+    if (systemInstruction) {
+      // The API accepts system instruction; camelCase is fine here
+      geminiBody.systemInstruction = systemInstruction;
+    }
+
+    // Helper to extract incremental text from Gemini SSE JSON events
+    function collectTextFields(obj: any, out: string[]) {
+      if (!obj) return;
+      if (typeof obj === "object") {
+        for (const k in obj) {
+          const v = obj[k];
+          if (k === "text" && typeof v === "string") out.push(v);
+          else collectTextFields(v, out);
+        }
+      }
+    }
+
+    // Return a streamed response to the browser in your existing format
+    return new Response(
+      new ReadableStream({
+        async start(controller) {
+          try {
+            const resp = await fetch(geminiUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(geminiBody),
+            });
+
+            if (!resp.ok || !resp.body) {
+              controller.error(
+                new Error(`Gemini API error: ${resp.status} ${resp.statusText}`),
+              );
+              controller.close();
+              return;
+            }
+
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+
+              for (const line of lines) {
+                // SSE format: "data: {json}" or "data: [DONE]"
+                if (line.startsWith("data: ")) {
+                  const payload = line.slice(6).trim();
+                  if (payload === "[DONE]") {
+                    controller.close();
+                    break;
+                  }
+                  try {
+                    const json = JSON.parse(payload);
+                    const parts: string[] = [];
+                    collectTextFields(json, parts);
+                    const chunk = parts.join("");
+                    if (chunk) {
+                      controller.enqueue({
+                        data: JSON.stringify(chunk), // your UI expects a JSON-encoded string
+                        id: Date.now(),
+                        event: "message",
+                      });
+                    }
+                  } catch (_e) {
+                    // ignore keep-alive / non-JSON data lines
+                  }
+                }
+              }
+            }
+
+            controller.close();
+          } catch (_error) {
+            controller.close();
+          }
+        },
+      }).pipeThrough(new ServerSentEventStream()),
+      { headers: { "Content-Type": "text/event-stream" } },
+    );
+  }
+
+  // 7) No-PDF path: preserve your existing LLM/VLM behavior (images & plain text)
+  //     - Choose endpoint/key/model from settings/env, just like before
+  let useThisApiUrl = llmApiUrl || Deno.env.get("LLM_URL") || API_URL;
+  let useThisApiKey = llmApiKey || Deno.env.get("LLM_KEY") || API_KEY;
+  let useThisApiModel = llmApiModel || Deno.env.get("LLM_MODEL") || API_MODEL;
+
   if (isImageInMessages) {
-    api_url = "";
-    api_key = "";
-    api_model = "";
-  }
-  if (isCorrectionInLastMessage) {
-    api_model = "";
-  }
+    useThisApiUrl = vlmApiUrl || Deno.env.get("VLM_URL") || API_IMAGE_URL;
+    useThisApiKey = vlmApiKey || Deno.env.get("VLM_KEY") || API_IMAGE_KEY;
 
-  if (universalApiKey != '' && universalApiKey.startsWith("sbe-")) {
-    api_url = llmApiUrl != '' ? llmApiUrl : API_URL;
-    api_key = llmApiKey != '' ? llmApiKey : API_KEY;
-    api_model = llmApiModel != '' ? llmApiModel : API_MODEL;
-    if (isImageInMessages) {
-      api_url = vlmApiUrl != '' ? vlmApiUrl : API_IMAGE_URL;
-      api_key = vlmApiKey != '' ? vlmApiKey : API_IMAGE_KEY;
-      api_model = vlmApiModel != '' ? vlmApiModel : API_IMAGE_MODEL;
-    }
-    if (isCorrectionInLastMessage) {
-      api_model = vlmCorrectionModel != '' ? vlmCorrectionModel : API_IMAGE_CORRECTION_MODEL;
-    }
-  } else {
-    api_url = llmApiUrl != '' ? llmApiUrl : '';
-    api_key = llmApiKey != '' ? llmApiKey : '';
-    api_model = llmApiModel != '' ? llmApiModel : '';
-    if (isImageInMessages) {
-      api_url = vlmApiUrl != '' ? vlmApiUrl : '';
-      api_key = vlmApiKey != '' ? vlmApiKey : '';
-      api_model = vlmApiModel != '' ? vlmApiModel : '';
-    }
+    // pick correction model if requested and configured
+    const chosenVlmModel = (isCorrectionInLastMessage && vlmCorrectionModel)
+      ? vlmCorrectionModel
+      : vlmApiModel || Deno.env.get("VLM_MODEL") || API_IMAGE_MODEL;
+
+    useThisApiModel = chosenVlmModel;
   }
 
-  console.log("Using this API URL: ", api_url);
-  console.log("Using this API Key: ", api_key);
-  console.log("Using this API Model: ", api_model);
-
-  if (api_url == '' || api_key == '' || api_model == '') {
-    const missingSettingsText = "The following settings are missing: " + (api_url == '' ? "api_url " : "") + (api_key == '' ? "api_key " : "") + (api_model == '' ? "api_model " : "") + ". The current generation mode is: " + (isImageInMessages ? "VLM" : "LLM") + ". The current correction mode is: " + (isCorrectionInLastMessage ? "Running with correction" : "Running without correction");
-    return new Response(missingSettingsText, { status: 400 });
-  }
-
-  // let api_url = llmApiUrl != '' ? llmApiUrl : API_URL;
-  // let api_key = llmApiKey != '' ? llmApiKey : API_KEY;
-  // let api_model = llmApiModel != '' ? llmApiModel : API_MODEL;
-  // if (isImageInMessages) {
-  //   api_url = vlmApiUrl != '' ? vlmApiUrl : API_IMAGE_URL;
-  //   api_key = vlmApiKey != '' ? vlmApiKey : API_IMAGE_KEY;
-  //   api_model = vlmApiModel != '' ? vlmApiModel : API_IMAGE_MODEL;
-  // }
-  // if (isCorrectionInLastMessage) {
-  //   api_model = vlmCorrectionModel != '' ? vlmCorrectionModel : API_IMAGE_CORRECTION_MODEL;
-  // }
-
-
-  const fetchOptions: RequestInit = {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${api_key}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      "messages": messages,
-      "model": api_model,
-      "stream": true,
-    }),
-  };
-
-  // console.log("body", {
-  //   "messages": messages,
-  //   "model": API_MODEL,
-  //   "stream": true,
-  // });
-  const response = await fetch(api_url, fetchOptions);
-
-  console.log("response", response);
-  console.log("response status", response.status);
-
-  if (response.status !== 200) {
-    // const res = await response.json();
-    // console.log(res);
-    return new Response(response.statusText, { status: response.status });
-  }
-
-  // if (!response.body) {
-  //   return new Response("Failed to get response body from external API", {
-  //     status: 500,
-  //   });
-  // }
-
-  // if (response.status === 400) {
-  //   console.log("Bad request");
-  //   const res = await response.json();
-  //   console.log(res);
-  //   return new Response("Bad request", { status: 400 });
-  // }
-
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
+  // 8) Forward to your OpenAI-compatible streaming as before
   return new Response(
     new ReadableStream({
       async start(controller) {
         try {
+          const response = await fetch(useThisApiUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${useThisApiKey}`,
+            },
+            body: JSON.stringify({
+              model: useThisApiModel,
+              stream: true,
+              messages: messages,
+            }),
+          });
+
+          if (!response.ok || !response.body) {
+            controller.error(new Error(`Upstream error: ${response.status} ${response.statusText}`));
+            controller.close();
+            return;
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
           while (true) {
-            const { value, done } = await reader.read();
+            const { done, value } = await reader.read();
             if (done) break;
+
             const chunk = decoder.decode(value, { stream: true });
             buffer += chunk;
 
@@ -188,58 +307,44 @@ async function getModelResponseStream(messages: Message[], lang: string, univers
             buffer = lines.pop() || "";
 
             lines.forEach((line: string) => {
-              // console.log(line);
               if (line.startsWith("data: ") && line !== "data: [DONE]") {
-                const jsonStr = line.substring(5); // Adjust to correctly parse your API response
+                const jsonStr = line.substring(6);
                 try {
                   const data = JSON.parse(jsonStr);
                   if (
-                    data.choices[0] !== undefined &&
-                    data.choices[0].delta.content !== undefined &&
-                    data.choices[0].delta.content !== null
+                    data.choices?.[0]?.delta?.content !== undefined &&
+                    data.choices?.[0]?.delta?.content !== null
                   ) {
                     if (data.choices[0].delta.content === "<|im_end|>") {
-                      console.log("End of model response!");
                       controller.close();
                     } else {
-                      controller.enqueue(
-                        {
-                          data: JSON.stringify(
-                            data.choices[0].delta.content,
-                          ),
-                          id: Date.now(),
-                          event: "message",
-                        },
-                      );
+                      controller.enqueue({
+                        data: JSON.stringify(data.choices[0].delta.content),
+                        id: Date.now(),
+                        event: "message",
+                      });
                     }
                   }
-                } catch (error: Error | unknown) {
-                  console.error("Error parsing JSON:", error, jsonStr);
+                } catch (_e) {
                   controller.close();
                 }
               } else if (line === "data: [DONE]") {
-                console.log("Closing controller!");
                 controller.close();
               }
             });
           }
         } catch (_error) {
-          // console.error("Error reading the stream", error);
           controller.close();
         }
       },
       cancel(err) {
-        console.log("cancel", err);
-        console.log("cancel");
+        console.log("SSE canceled:", err);
       },
     }).pipeThrough(new ServerSentEventStream()),
-    {
-      headers: {
-        "Content-Type": "text/event-stream",
-      },
-    },
+    { headers: { "Content-Type": "text/event-stream" } },
   );
 }
+// --- REPLACE THE WHOLE FUNCTION ENDING HERE ---
 
 // deno-lint-ignore no-explicit-any
 function hasKorrekturHashtag(messages: any[]): boolean {

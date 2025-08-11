@@ -225,7 +225,7 @@ export const settingsContent: InternalizationContent = {
     chatApiTitle: "Chat API",
     ttsTitle: "Text-to-Speech",
     sttTitle: "Speech-to-Text",
-    vlmTitle: "Vision Language Model",
+    vlmTitle: "Vision & PDF Language Model",
   },
   de: {
     title: "Einstellungen",
@@ -266,6 +266,6 @@ export const settingsContent: InternalizationContent = {
     chatApiTitle: "Chat API",
     ttsTitle: "Text-zu-Sprache",
     sttTitle: "Sprache-zu-Text",
-    vlmTitle: "Bildverarbeitung",
+    vlmTitle: "Bild- und PDF-Verarbeitung",
   },
 };

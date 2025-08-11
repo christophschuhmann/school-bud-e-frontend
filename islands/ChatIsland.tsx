@@ -9,6 +9,8 @@ import ChatTemplate from "../components/ChatTemplate.tsx";
 import { ChatSubmitButton } from "../components/ChatSubmitButton.tsx";
 import ImageUploadButton from "../components/ImageUploadButton.tsx";
 import VoiceRecordButton from "../components/VoiceRecordButton.tsx";
+import { PdfUploadButton, PdfFile } from "../components/PdfUploadButton.tsx"; 
+
 
 // Necessary for streaming service
 import {
@@ -59,6 +61,8 @@ export default function ChatIsland({ lang }: { lang: string }) {
   const [readAlways, setReadAlways] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [images, setImages] = useState([] as Image[]);
+  const [pdfs, setPdfs] = useState([] as PdfFile[]);
+
   const [isStreamComplete, setIsStreamComplete] = useState(true);
   const [stopList, setStopList] = useState([] as number[]);
   const [currentEditIndex, setCurrentEditIndex] = useState(
@@ -510,6 +514,10 @@ export default function ChatIsland({ lang }: { lang: string }) {
     setImages((prevImages) => [...prevImages, ...newImages]);
   };
 
+  const handlePdfsUploaded = (newPdfs: PdfFile[]) => {
+    setPdfs((prevPdfs) => [...prevPdfs, ...newPdfs]);
+  };
+
   const handleImageChange = (images: Image[]) => {
     console.log("Images from ChatIsland: ", images);
 
@@ -632,6 +640,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
       },
     );
     setAudioFileDict({ ...audioFileDict });
+
     const ongoingStream: string[] = [];
     let currentAudioIndex = 1;
     if (isStreamComplete) {
@@ -642,34 +651,46 @@ export default function ChatIsland({ lang }: { lang: string }) {
       let previousMessages = prevMessages || messages;
 
       previousMessages = previousMessages.map((msg) => {
-        if (typeof msg.content === "string") {
-          return msg;
-        }
-        if (typeof msg.content[0] === "string") {
-          return { "role": msg.role, "content": msg.content.join("") };
-        }
+        if (typeof msg.content === "string") return msg;
+        if (typeof msg.content[0] === "string") return { "role": msg.role, "content": msg.content.join("") };
         return msg;
       });
 
-      const queryWithImages = [];
-      if (images.length !== 0) {
-        queryWithImages.push({ "type": "text", "text": currentQuerry });
+      // --- ANFANG DER ÄNDERUNG ---
+      // Hier erstellen wir jetzt eine flexible Payload, die Text, Bilder und PDFs enthalten kann.
+      const contentPayload: any[] = [];
+      
+      // 1. Füge den Text-Prompt hinzu
+      contentPayload.push({ type: "text", text: currentQuerry });
+
+      // 2. Füge alle hochgeladenen Bilder hinzu (alte Logik)
+      if (images.length > 0) {
         for (const img of images) {
-          queryWithImages.push(img);
+          // Wir behalten das alte Format für Bilder bei, um Abwärtskompatibilität zu gewährleisten
+          contentPayload.push(img); 
+        }
+      }
+
+      // 3. HINZUGEFÜGT: Füge alle hochgeladenen PDFs hinzu
+      if (pdfs.length > 0) {
+        for (const pdf of pdfs) {
+          contentPayload.push(pdf);
         }
       }
 
       const newMessages = [...previousMessages, {
-        "role": "user",
-        "content": images.length === 0 ? currentQuerry : queryWithImages,
+        role: "user",
+        content: contentPayload,
       }];
-
-      setImages([]);
-
+      // UI sofort aktualisieren
       setMessages(newMessages as Message[]);
 
+      // Wichtig: Setze alle Eingabefelder und Dateilisten zurück
+      setImages([]);
+      setPdfs([]); // NEU
+      setMessages(newMessages as Message[]);
       setQuery("");
-
+      
       // check if the last message has #bildungsplan in the content (case insensitive)
       // #bildungsplan: wofür braucht man eigentlich trigonometrie:5
       const isBildungsplanInLastMessage = currentQuerry.toLowerCase().includes(
@@ -1349,6 +1370,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
       <ChatTemplate
         lang={lang}
         parentImages={images}
+        parentPdfs={pdfs} 
         messages={messages}
         isComplete={isStreamComplete}
         readAlways={readAlways}
@@ -1378,27 +1400,32 @@ export default function ChatIsland({ lang }: { lang: string }) {
           (settings.apiKey && settings.apiModel && settings.apiUrl)
         ? (
           <div className="relative mt-4 mb-12">
-            <textarea
-              type="text"
-              value={query}
-              placeholder={chatIslandContent[lang]["placeholderText"]}
-              onInput={(e) => {
-                const textarea = e.currentTarget;
-                textarea.style.height = "auto"; // Reset height to auto to get the correct new height
-                textarea.style.height = textarea.scrollHeight + "px"; // Set new height
-                setQuery(e.currentTarget.value); // Update query and possibly the messages array
-              }}
-              onKeyPress={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault(); // Prevents adding a new line in the textarea
-                  startStream("");
-                }
-              }}
-              class="h-auto w-full min-h-[10rem] py-4 pl-4 pr-16 border border-gray-300 rounded-lg focus:outline-none cursor-text focus:border-orange-200 focus:ring-1 focus:ring-orange-300 shadow-sm resize-none placeholder-gray-400 text-base font-medium overflow-hidden"
-            />
+          <textarea
+            type="text"
+            value={query}
+            placeholder={chatIslandContent[lang]["placeholderText"]}
+            onInput={(e) => {
+              const textarea = e.currentTarget;
+              textarea.style.height = "auto";
+              textarea.style.height = textarea.scrollHeight + "px";
+              setQuery(e.currentTarget.value);
+            }}
+            onKeyPress={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                startStream("");
+              }
+            }}
+            class="h-auto w-full min-h-[12.5rem] py-4 pl-4 pr-16 border border-gray-300 rounded-lg focus:outline-none cursor-text focus:border-orange-200 focus:ring-1 focus:ring-orange-300 shadow-sm resize-none placeholder-gray-400 text-base font-medium overflow-hidden"
+          />
 
             <ImageUploadButton
               onImagesUploaded={handleImagesUploaded}
+            />
+
+
+            <PdfUploadButton
+              onPdfsUploaded={handlePdfsUploaded}
             />
 
             <VoiceRecordButton
@@ -1416,7 +1443,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
 
             <ChatSubmitButton
               onClick={() => startStream("")}
-              disabled={!query}
+              disabled={!query && images.length === 0 && pdfs.length === 0}
             />
           </div>
         )
