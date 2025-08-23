@@ -1327,6 +1327,7 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
               sttUrl={settings.sttUrl}
               sttKey={settings.sttKey}
               sttModel={settings.sttModel}
+              universalApiKey={settings.universalApiKey}
               onFinishRecording={(finalTranscript) => {
                 startStream(finalTranscript);
               }}

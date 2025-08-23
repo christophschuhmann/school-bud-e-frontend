@@ -14,6 +14,11 @@ import { IS_BROWSER } from "$fresh/runtime.ts";
  * @param {string} props.sttModel - The model to use for speech-to-text conversion.
  * @returns {JSX.Element} The VoiceRecordButton component.
  */
+
+
+
+// PASTE THIS ENTIRE REVISED FUNCTION IN: school-bud-e-frontend/components/VoiceRecordButton.tsx
+
 function VoiceRecordButton({
   onFinishRecording,
   onInterimTranscript,
@@ -21,6 +26,7 @@ function VoiceRecordButton({
   sttUrl,
   sttKey,
   sttModel,
+  universalApiKey, // <-- CHANGED: Added the universalApiKey prop to be received
 }: {
   onFinishRecording: (transcript: string) => void;
   onInterimTranscript: (transcript: string) => void;
@@ -28,6 +34,7 @@ function VoiceRecordButton({
   sttUrl: string;
   sttKey: string;
   sttModel: string;
+  universalApiKey: string; // <-- CHANGED: Defined the type for the new prop
 }) {
   const [isRecording, setIsRecording] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -69,11 +76,9 @@ function VoiceRecordButton({
 
   async function toggleRecording() {
     if (isRecording) {
-      // Stop recording
       mediaRecorderRef.current?.stop();
       setIsRecording(false);
     } else {
-      // Start recording
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
@@ -107,6 +112,7 @@ function VoiceRecordButton({
     formData.append("sttUrl", sttUrl);
     formData.append("sttKey", sttKey);
     formData.append("sttModel", sttModel);
+    formData.append("universalApiKey", universalApiKey); // <-- CHANGED: Add the universal key to the form data
 
     try {
       const response = await fetch("/api/stt", {
@@ -130,13 +136,11 @@ function VoiceRecordButton({
   function onEnd() {
     console.log("Speech recognition has stopped. Starting again ...");
     setIsRecording(false);
-    // restartRecording();
   }
 
   const prependToTranscript = "";
   // deno-lint-ignore no-explicit-any
   function onSpeak(event: any) {
-    // console.log(resetTranscript);
     let interimTranscript = "";
     for (let i = event.resultIndex; i < event.results.length; ++i) {
       if (event.results[i].isFinal) {
@@ -146,7 +150,6 @@ function VoiceRecordButton({
         interimTranscript += event.results[i][0].transcript;
       }
     }
-    // Here, you call onInterimTranscript with the interimTranscript
     if (interimTranscript) {
       console.log("Interim transcript: ", prependToTranscript);
       onInterimTranscript(prependToTranscript + interimTranscript);
