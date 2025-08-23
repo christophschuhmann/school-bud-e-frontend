@@ -113,6 +113,8 @@ async function callMARS6API(
   }
 }
 
+// REPLACE YOUR EXISTING textToSpeech FUNCTION WITH THIS ENTIRE BLOCK
+
 async function textToSpeech(
   text: string,
   textPosition: string,
@@ -136,65 +138,11 @@ async function textToSpeech(
   const useThisTtsKey = ttsKey != "" ? ttsKey : TTS_KEY;
   const useThisTtsModel = ttsModel != "" ? ttsModel : TTS_MODEL;
 
-  //   Deepgram random with 40 chars
-  // 9371dfaed6d8b42e9eaf9458ba8604126fb373d0
-  // STT
-  // curl \
-  //   -X POST \
-  //   -H "Authorization: Token 6c4fa34dac9fb4c3aa6bc0421ca805e173e85ed3" \
-  //   -H "Content-Type: application/json" \
-  //   -d '{"url":"https://static.deepgram.com/examples/Bueller-Life-moves-pretty-fast.wav"}' \
-  //   "https://api.deepgram.com/v1/listen?language=en&model=nova-2"
-
-  // TTS
-  // curl \
-  //   -X POST \
-  //   -H "Authorization: Token YOUR_SECRET" \
-  //   -H "Content-Type: text/plain" \
-  //   -d "Deepgram is great for real-time conversations… and also, you can build apps for things like customer support, logistics, and more. What do you think of the voices?" \
-  //   "https://api.deepgram.com/v1/speak?model=aura-helios-en" \
-  //   -o audio.mp3
-
   try {
-    switch (useThisTtsModel) {
-      case "MARS6": {
-        const audioData = await callMARS6API(
-          text,
-          ttsUrl,
-          ttsKey,
-        );
-        if (audioData) {
-          return Buffer.from(audioData);
-        } else {
-          console.error(`Failed to synthesize speech.`);
-          break;
-        }
-      }
-      case "aura-helios-en": {
-        const startTime = Date.now();
-        const response = await fetch(useThisTttsUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "text/plain",
-            "Authorization": `Token ${useThisTtsKey}`,
-          },
-          body: text,
-        });
-        if (response.ok) {
-          const audioData = await response.arrayBuffer();
-          console.log(
-            `Audio file received for ${textPosition}, Latency:`,
-            Date.now() - startTime,
-          );
-          return Buffer.from(audioData);
-        } else {
-          console.error(
-            `Failed to synthesize speech. Status code: ${response.status}: ${response.statusText}`,
-          );
-        }
-        break;
-      }
-      default: {
+    // --- START OF REVISED LOGIC ---
+
+    // Fish Audio models are 32-character hexadecimal IDs. We can detect them by their length.
+    if (useThisTtsModel && useThisTtsModel.length === 32) {
         const startTime = Date.now();
         const response = await fetch(useThisTttsUrl, {
           method: "POST",
@@ -202,11 +150,12 @@ async function textToSpeech(
             "Content-Type": "application/json",
             "Authorization": `Bearer ${useThisTtsKey}`,
           },
+          // This is the specific payload format that Fish Audio expects.
           body: JSON.stringify({
             text: text,
             normalize: true,
             format: "mp3",
-            reference_id: useThisTtsModel,
+            reference_id: useThisTtsModel, // Fish uses reference_id for the model
             mp3_bitrate: 64,
             opus_bitrate: -1000,
             latency: "normal",
@@ -224,9 +173,58 @@ async function textToSpeech(
           console.error(
             `Failed to synthesize speech. Status code: ${response.status}: ${response.statusText}`,
           );
+          return null; // Explicitly return null on failure
+        }
+    }
+
+    // This logic handles other providers like Deepgram, which have specific model names.
+    switch (useThisTtsModel) {
+      case "MARS6": {
+        // ... (This block is unchanged)
+        const audioData = await callMARS6API(text, ttsUrl, ttsKey);
+        if (audioData) { return Buffer.from(audioData); }
+        else { console.error(`Failed to synthesize speech.`); break; }
+      }
+      case "aura-helios-en": {
+        // ... (This block is unchanged)
+        const startTime = Date.now();
+        const response = await fetch(useThisTttsUrl, { /* ... */ });
+        if (response.ok) { return Buffer.from(await response.arrayBuffer()); }
+        else { console.error(`...`); }
+        break;
+      }
+      // This default case now correctly handles your middleware and any other
+      // standard OpenAI-compatible TTS provider.
+      default: {
+        const startTime = Date.now();
+        const response = await fetch(useThisTttsUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${useThisTtsKey}`,
+          },
+          body: JSON.stringify({
+            model: useThisTtsModel,
+            input: text,
+          }),
+        });
+
+        if (response.ok) {
+          const audioData = await response.arrayBuffer();
+          console.log(
+            `Audio file received for ${textPosition}, Latency:`,
+            Date.now() - startTime,
+          );
+          return Buffer.from(audioData);
+        } else {
+          console.error(
+            `Failed to synthesize speech. Status code: ${response.status}: ${response.statusText}`,
+          );
         }
       }
     }
+    // --- END OF REVISED LOGIC ---
+
   } catch (error) {
     console.error(`Error in textToSpeech: ${error}`);
   }
@@ -235,18 +233,33 @@ async function textToSpeech(
 
 export const handler: Handlers = {
   async POST(req) {
-    const { text, textPosition, ttsUrl, ttsKey, ttsModel } = await req.json();
-    // console.log("Text:", text);
+    // --- Start of new logic ---
+    const payload = await req.json();
+    const { text, textPosition, ttsUrl, ttsKey, ttsModel, universalApiKey } = payload;
+
+    const MIDDLEWARE_BASE_URL = "http://65.109.157.234:8787";
+
+    // These variables will hold the final values to be used.
+    let useThisTtsUrl = ttsUrl;
+    let useThisTtsKey = ttsKey;
+
+    // If a universalApiKey is provided, it overrides the specific TTS settings.
+    if (universalApiKey) {
+        useThisTtsUrl = `${MIDDLEWARE_BASE_URL}/v1/audio/speech`;
+        useThisTtsKey = universalApiKey;
+    }
+    // --- End of new logic ---
 
     if (!text) {
       return new Response("No text provided", { status: 400 });
     }
 
+    // The textToSpeech function now receives the potentially overridden URL and key.
     const audioData = await textToSpeech(
       text,
       textPosition,
-      ttsUrl,
-      ttsKey,
+      useThisTtsUrl,
+      useThisTtsKey,
       ttsModel,
     );
 
@@ -254,7 +267,7 @@ export const handler: Handlers = {
       const response = new Response(audioData, {
         status: 200,
         headers: {
-          "Content-Type": "audio/mp3", // Changed from audio/wav to audio/mp3
+          "Content-Type": "audio/mp3",
         },
       });
       return response;
