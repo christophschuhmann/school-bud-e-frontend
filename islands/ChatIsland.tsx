@@ -9,15 +9,14 @@ import ChatTemplate from "../components/ChatTemplate.tsx";
 import { ChatSubmitButton } from "../components/ChatSubmitButton.tsx";
 import ImageUploadButton from "../components/ImageUploadButton.tsx";
 import VoiceRecordButton from "../components/VoiceRecordButton.tsx";
-import { PdfUploadButton, PdfFile } from "../components/PdfUploadButton.tsx"; 
-
+import { PdfUploadButton, PdfFile } from "../components/PdfUploadButton.tsx";
 
 // Necessary for streaming service
 import {
   EventSourceMessage,
   fetchEventSource,
 } from "https://esm.sh/@microsoft/fetch-event-source@2.0.1";
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 
 // Internalization
 import { chatIslandContent } from "../internalization/content.ts";
@@ -71,8 +70,8 @@ export default function ChatIsland({ lang }: { lang: string }) {
 
   const [messages, setMessages] = useState([
     {
-      "role": "assistant",
-      "content": [chatIslandContent[lang]["welcomeMessage"]],
+      role: "assistant",
+      content: [chatIslandContent[lang]["welcomeMessage"]],
     },
   ] as Message[]);
 
@@ -96,6 +95,25 @@ export default function ChatIsland({ lang }: { lang: string }) {
     vlmCorrectionModel: localStorage.getItem("bud-e-vlm-correction-model") ||
       "",
   });
+
+  // ====== Composer control (fixed height, no auto-grow) ======
+  const composeRef = useRef<HTMLTextAreaElement>(null);
+  const resetComposerHeight = () => {
+    if (composeRef.current) composeRef.current.style.height = "";
+  };
+  const handleComposerInput = (e: any) => {
+    setQuery(e.currentTarget.value);
+  };
+
+  // Active stream aborter (for Cancel)
+  const currentStreamAbortRef = useRef<AbortController | null>(null);
+  const cancelStream = () => {
+    if (currentStreamAbortRef.current) {
+      currentStreamAbortRef.current.abort();
+      currentStreamAbortRef.current = null;
+    }
+    setIsStreamComplete(true);
+  };
 
   // Add useEffect for loading settings
   useEffect(() => {
@@ -149,13 +167,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
   // #################
   // ### useEffect ###
   // #################
-  // Explanation: If a value changes, the useEffect hook is called. This is useful for side effects like fetching data or updating the DOM.
-
-  // 1. useEffect []: Load chat messages from localStorage on first load
-  // 2. useEffect [isStreamComplete]: Save chat messages to localStorage when the stream is complete
-  // 3. useEffect [messages]: Automatic scrolling to last message on incoming messages
-  // 4. useEffect [currentChatSuffix]: Load messages from localStorage when the chat suffix changes
-  // 5. useEffect [audioFileDict, readAlways, stopList]: Play incoming audio files when readAlways is true
 
   // 1. useEffect
   // Runs once on startup to load the chat messages from localStorage
@@ -174,8 +185,8 @@ export default function ChatIsland({ lang }: { lang: string }) {
     );
     localStorageMessages = localStorageMessages || [
       {
-        "role": "assistant",
-        "content": [
+        role: "assistant",
+        content: [
           chatIslandContent[lang]["welcomeMessage"],
         ],
       },
@@ -201,7 +212,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
         if (lastMessageFromBuddy !== "" && messages.length > 1) {
           messages[messages.length - 1]["content"] = lastMessageFromBuddy;
 
-          console.log("IS_STREAM_COMPLETE", currentChatSuffix);
           localStorage.setItem(
             "bude-chat-" + currentChatSuffix,
             JSON.stringify(messages),
@@ -227,19 +237,18 @@ export default function ChatIsland({ lang }: { lang: string }) {
   // 3. useEffect [messages]
   useEffect(() => {
     if (autoScroll) {
-      // Find the scrollable chat container element we created earlier
-      const chatContainer = document.querySelector('.chat-history');
+      const chatContainer = document.querySelector(".chat-history") as
+        | HTMLElement
+        | null;
       if (chatContainer) {
-        // Scroll the container smoothly to the bottom to show the newest message
         chatContainer.scrollTo({
           top: chatContainer.scrollHeight,
-          behavior: 'smooth',
+          behavior: "smooth",
         });
       }
     }
 
     if (!firstLoad) {
-      // console.log("MESSAGES", currentChatSuffix);
       localStorage.setItem(
         "bude-chat-" + currentChatSuffix,
         JSON.stringify(messages),
@@ -261,8 +270,8 @@ export default function ChatIsland({ lang }: { lang: string }) {
       String(localStorage.getItem("bude-chat-" + currentChatSuffix)),
     ) || [
       {
-        "role": "assistant",
-        "content": [
+        role: "assistant",
+        content: [
           chatIslandContent[lang]["welcomeMessage"],
         ],
       },
@@ -279,6 +288,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
     setMessages(localStorageMessages);
     stopAndResetAudio();
     setStopList([]);
+    resetComposerHeight(); // ensure composer height is clean when switching chats
   }, [currentChatSuffix]);
 
   // 5. useEffect [audioFileDict, readAlways, stopList]
@@ -374,17 +384,29 @@ export default function ChatIsland({ lang }: { lang: string }) {
 
   // 1. handleRefreshAction
   const handleRefreshAction = (groupIndex: number) => {
+    // groupIndex points to the assistant message we want to regenerate.
+    // We need the *preceding user* message's text.
     if (groupIndex > 0 && groupIndex <= messages.length) {
+      const userMsg = messages[groupIndex - 1];
+      // extract plain text from the user message
+      let userText = "";
+      if (typeof userMsg?.content === "string") {
+        userText = userMsg.content;
+      } else if (Array.isArray(userMsg?.content)) {
+        const textPart = userMsg.content.find((c: any) =>
+          c?.type === "text" && typeof c.text === "string"
+        );
+        userText = textPart?.text ??
+          userMsg.content
+            .map((c: any) => (typeof c === "string" ? c : c?.text || ""))
+            .join("");
+      }
+
+      // keep history only up to *before* that user message (so we don't duplicate it)
       const slicedMessages = messages.slice(0, groupIndex - 1) as Message[];
       setMessages(slicedMessages);
-
-      // const lastMessage = isArray(messages[groupIndex - 1]["content"]) ;
-      const refreshMessage = Array.isArray(messages[groupIndex - 1]["content"])
-        ? messages[groupIndex - 1]["content"]
-        : messages[groupIndex - 1]["content"];
-
       setStopList([]);
-      startStream(refreshMessage as string, slicedMessages);
+      startStream(userText, slicedMessages);
     }
   };
 
@@ -409,28 +431,23 @@ export default function ChatIsland({ lang }: { lang: string }) {
       }
     }
 
-    // setMessages((prevMessages) => prevMessages.slice(0, groupIndex));
     setQuery(contentToEdit);
     setStopList([]);
     setCurrentEditIndex(groupIndex);
 
     const textarea = document.querySelector("textarea");
-    textarea!.focus();
+    textarea?.focus();
   };
 
   // 3. handleOnSpeakAtGroupIndexAction
   const handleOnSpeakAtGroupIndexAction = (groupIndex: number) => {
-    console.log("[LOG] handleOnSpeakAtGroupIndexAction", groupIndex);
     if (!audioFileDict[groupIndex]) {
-      console.log("No audio file found for groupIndex", groupIndex);
-      console.log("AudioFileDict", audioFileDict);
-      const lastMessage = Array.isArray(messages[groupIndex])
-        ? messages[groupIndex][0]
-        : messages[groupIndex];
-      console.log("lastMessage", lastMessage);
-      const parsedLastMessage = Array.isArray(lastMessage["content"])
-        ? lastMessage["content"].join("")
-        : lastMessage["content"];
+      const msgObj = messages[groupIndex];
+      const parsedLastMessage = typeof msgObj?.content === "string"
+        ? msgObj.content
+        : Array.isArray(msgObj?.content)
+        ? msgObj.content.map((p: any) => (p?.type === "text" ? p.text : "")).join("")
+        : "";
       if (parsedLastMessage === "") return;
       getTTS(
         parsedLastMessage as string,
@@ -443,10 +460,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
         .findIndex(([_, item]) => !item.audio.paused);
 
       if (indexThatIsPlaying !== -1) {
-        // Pause current audio
-        // audioFileDict[groupIndex][indexThatIsPlaying].audio.pause();
-        // audioFileDict[groupIndex][indexThatIsPlaying].audio.currentTime = 0;
-
+        // Pause any playing audio
         (Object.values(audioFileDict) as Record<number, AudioItem>[]).forEach(
           (group) => {
             (Object.values(group) as AudioItem[]).forEach((item) => {
@@ -459,7 +473,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
         );
 
         setStopList([...stopList, groupIndex]);
-        // Force state update after pausing
         setAudioFileDict({ ...audioFileDict });
       } else {
         setStopList(stopList.filter((item) => item !== groupIndex));
@@ -486,12 +499,10 @@ export default function ChatIsland({ lang }: { lang: string }) {
             if (audioFileDict[groupIndex][index + 1]) {
               audioFileDict[groupIndex][index + 1].audio.play();
             }
-            // Update state after each audio finishes
             setAudioFileDict({ ...audioFileDict });
           };
         });
 
-        // Force immediate state update when starting playback
         setAudioFileDict({ ...audioFileDict });
       }
 
@@ -501,13 +512,11 @@ export default function ChatIsland({ lang }: { lang: string }) {
 
   // 4. handleUploadActionToMessages
   const handleUploadActionToMessages = (uploadedMessages: Message[]) => {
-    console.log("From hanldeUploadActionToMessages");
-    console.log(uploadedMessages);
     const newMessages = uploadedMessages.map((msg) => [msg]).flat();
     newMessages[newMessages.length - 1] = newMessages[newMessages.length - 1];
     setMessages(newMessages);
     const textarea = document.querySelector("textarea");
-    textarea!.focus();
+    textarea?.focus();
   };
 
   const handleImagesUploaded = (newImages: Image[]) => {
@@ -519,8 +528,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
   };
 
   const handleImageChange = (images: Image[]) => {
-    console.log("Images from ChatIsland: ", images);
-
     setImages(images);
   };
 
@@ -613,233 +620,311 @@ export default function ChatIsland({ lang }: { lang: string }) {
   // 2.1 readAlways is true and new stream comes in or
   // 2.2 the loudspeaker button is clicked in chatTemplate to play groupIndex
   //     (handleOnSpeakAtGroupIndex)
-  // 1. startStream
+
   // 1) Drop-in replacement for: islands/ChatIsland.tsx -> const startStream = async (...)
-const startStream = async (transcript: string, prevMessages?: Message[]) => {
-  // If we're editing a previous user message (and not the last one), just update and exit
-  if (currentEditIndex !== undefined && currentEditIndex !== -1) {
-    const updated = [...messages];
-    updated[currentEditIndex] = {
-      ...updated[currentEditIndex],
-      content: query,
-    };
-    setMessages(updated);
-    setQuery("");
-    setCurrentEditIndex(-1);
-    return;
-  }
-
-  // Stop any ongoing audio and reset players
-  (Object.values(audioFileDict) as Record<number, AudioItem>[]).forEach((group) => {
-    (Object.values(group) as AudioItem[]).forEach((item) => {
-      if (!item.audio.paused) item.audio.pause();
-      item.audio.currentTime = 0;
-    });
-  });
-  setAudioFileDict({ ...audioFileDict });
-
-  if (!isStreamComplete) return;
-
-  setIsStreamComplete(false);
-  setResetTranscript((n) => n + 1);
-
-  // Build the outbound user "content" payload (text + images + PDFs)
-  const userText = transcript && transcript.trim() !== "" ? transcript : query;
-  let previousMessages = prevMessages || messages;
-
-  // Normalize any array-based assistant texts into plain strings for safety
-  previousMessages = previousMessages.map((m) => {
-    if (typeof m.content === "string") return m;
-    if (Array.isArray(m.content) && typeof m.content[0] === "string") {
-      return { role: m.role, content: (m.content as string[]).join("") };
+  const startStream = async (transcript: string, prevMessages?: Message[]) => {
+    // If we're editing a previous user message (and not the last one), just update and exit
+    if (currentEditIndex !== undefined && currentEditIndex !== -1) {
+      const updated = [...messages];
+      updated[currentEditIndex] = {
+        ...updated[currentEditIndex],
+        content: query,
+      };
+      setMessages(updated);
+      setQuery("");
+      setCurrentEditIndex(-1);
+      resetComposerHeight();
+      return;
     }
-    return m;
-  });
 
-  const contentPayload: any[] = [{ type: "text", text: userText }];
-  if (images.length > 0) for (const img of images) contentPayload.push(img);
-  if (pdfs.length > 0) for (const pdf of pdfs) contentPayload.push(pdf);
+    // Stop any ongoing audio and reset players
+    (Object.values(audioFileDict) as Record<number, AudioItem>[]).forEach(
+      (group) => {
+        (Object.values(group) as AudioItem[]).forEach((item) => {
+          if (!item.audio.paused) item.audio.pause();
+          item.audio.currentTime = 0;
+        });
+      },
+    );
+    setAudioFileDict({ ...audioFileDict });
 
-  const newMessages: Message[] = [
-    ...previousMessages,
-    { role: "user", content: contentPayload },
-  ];
+    if (!isStreamComplete) return;
 
-  // Clear composer state immediately for snappy UX
-  setImages([]);
-  setPdfs([]);
-  setMessages(newMessages);
-  setQuery("");
+    setIsStreamComplete(false);
+    setResetTranscript((n) => n + 1);
 
-  // Hashtag short-circuits (#wikipedia / #papers / #bildungsplan) — non-streaming
-  const lower = userText.toLowerCase();
+    // Build the outbound user "content" payload (text + images + PDFs)
+    const userText = transcript && transcript.trim() !== "" ? transcript : query;
+    let previousMessages = prevMessages || messages;
 
-  // #wikipedia[:collection][:n]
-  if (lower.includes("#wikipedia") || lower.includes("#wikipedia_de") || lower.includes("#wikipedia_en")) {
-    let collection = lang === "en" ? "English-ConcatX-Abstract" : "German-ConcatX-Abstract";
-    if (lower.includes("#wikipedia_de")) collection = "German-ConcatX-Abstract";
-    if (lower.includes("#wikipedia_en")) collection = "English-ConcatX-Abstract";
-
-    const parts = userText.split(":");
-    const q = (parts[1] ?? "").trim();
-    let n = 5;
-    if (parts.length > 2) n = parseInt((parts[2] ?? "5").trim(), 10) || 5;
-
-    const res = await fetchWikipedia(q, collection, n);
-    const out = (res || []).map((r: WikipediaResult, i: number) =>
-      `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${(res || []).length}**\n**${chatIslandContent[lang].wikipediaTitle}**: ${r.Title}\n**${chatIslandContent[lang].wikipediaURL}**: ${r.URL}\n**${chatIslandContent[lang].wikipediaContent}**: ${r.content}\n**${chatIslandContent[lang].wikipediaScore}**: ${r.score}`
-    ).join("\n\n");
-
-    setMessages((m) => [...m, { role: "assistant", content: out }]);
-    setIsStreamComplete(true);
-    return;
-  }
-
-  // #papers:query[:limit]
-  if (lower.includes("#papers")) {
-    const parts = userText.split(":");
-    const q = (parts[1] ?? "").trim();
-    let limit = 5;
-    if (parts.length > 2) limit = parseInt((parts[2] ?? "5").trim(), 10) || 5;
-
-    const res = await fetchPapers(q, limit);
-    const items = res?.payload?.items || [];
-    const out = items.map((it: PapersItem, i: number) => {
-      const authors = it.authors?.join(", ") || "";
-      const subjs = it.subjects?.join(", ") || "";
-      const papersTitle = chatIslandContent[lang].papersTitle ?? "Title";
-      const papersAuthors = chatIslandContent[lang].papersAuthors ?? "Authors";
-      const papersSubjects = chatIslandContent[lang].papersSubjects ?? "Subjects";
-      const papersAbstract = chatIslandContent[lang].papersAbstract ?? "Abstract";
-      const doiLabel = "DOI";
-      return `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${items.length}**\n**${papersTitle}**: ${it.title}\n**${papersAuthors}**: ${authors}\n**${papersSubjects}**: ${subjs}\n**${doiLabel}**: ${it.doi}\n**${papersAbstract}**: ${it.abstract}`;
-    }).join("\n\n");
-
-    setMessages((m) => [...m, { role: "assistant", content: out }]);
-    setIsStreamComplete(true);
-    return;
-  }
-
-  // #bildungsplan:query[:top_n]
-  if (lower.includes("#bildungsplan")) {
-    const parts = userText.split(":");
-    const q = (parts[1] ?? "").trim();
-    let top_n = 5;
-    if (parts.length > 2) top_n = parseInt((parts[2] ?? "5").trim(), 10) || 5;
-
-    const res = await fetchBildungsplan(q, top_n);
-    const results = res?.results || [];
-    const out = results.map((r, i) =>
-      `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${results.length}**\n${r.text}\n\n**Score**: ${r.score}`
-    ).join("\n\n");
-
-    setMessages((m) => [...m, { role: "assistant", content: out }]);
-    setIsStreamComplete(true);
-    return;
-  }
-
-  // === Streaming path (LLM) ===
-  const ongoingStream: string[] = []; // buffer for sentence-boundary TTS
-  let currentAudioIndex = 1;
-
-  await fetchEventSource("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      lang,
-      messages: newMessages,
-      universalApiKey: settings.universalApiKey,
-      llmApiUrl: settings.apiUrl,
-      llmApiKey: settings.apiKey,
-      llmApiModel: settings.apiModel,
-      vlmApiUrl: settings.vlmUrl,
-      vlmApiKey: settings.vlmKey,
-      vlmApiModel: settings.vlmModel,
-      vlmCorrectionModel: settings.vlmCorrectionModel,
-      systemPrompt: settings.systemPrompt,
-    }),
-
-    // IMPORTANT CHANGE: append chunks into a SINGLE assistant row (string), not one row per chunk
-    async onopen(response: Response) {
-      // create a single assistant message with empty string to stream into
-      setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
-      if (response.ok) return;
-      if (response.status !== 200) {
-        const errorText = await response.text();
-        throw new FatalError(`**BACKEND ERROR**\nStatuscode: ${response.status}\nMessage: ${errorText}`);
+    // Normalize any array-based assistant texts into plain strings for safety
+    previousMessages = previousMessages.map((m) => {
+      if (typeof m.content === "string") return m;
+      if (Array.isArray(m.content) && typeof m.content[0] === "string") {
+        return { role: m.role, content: (m.content as string[]).join("") };
       }
-      throw new RetriableError();
-    },
+      return m;
+    });
 
-    onmessage(ev) {
-      const chunk = JSON.parse(ev.data) as string;
+    const contentPayload: any[] = [{ type: "text", text: userText }];
+    if (images.length > 0) for (const img of images) contentPayload.push(img);
+    if (pdfs.length > 0) for (const pdf of pdfs) contentPayload.push(pdf);
 
-      // Buffer for TTS by sentence
-      ongoingStream.push(chunk);
-      const combined = ongoingStream.join("");
+    const newMessagesArr: Message[] = [
+      ...previousMessages,
+      { role: "user", content: contentPayload },
+    ];
 
-      // speak when we hit a sentence-end that's not a decimal number boundary
-      const re = /(?<!\d)[.!?]/g;
-      let lastIdx = -1, m: RegExpExecArray | null;
-      while ((m = re.exec(combined)) !== null) lastIdx = m.index;
-      if (lastIdx !== -1) {
-        const split = lastIdx + 1;
-        const toSpeak = combined.slice(0, split).trim();
-        const remaining = combined.slice(split);
-        if (toSpeak) {
-          getTTS(toSpeak, newMessages.length, `stream${currentAudioIndex}`);
-          currentAudioIndex++;
-        }
-        ongoingStream.length = 0;
-        if (remaining.trim()) ongoingStream.push(remaining);
+    // Clear composer state immediately for snappy UX
+    setImages([]);
+    setPdfs([]);
+    setMessages(newMessagesArr);
+    setQuery("");
+    resetComposerHeight();
+
+    // Hashtag short-circuits (#wikipedia / #papers / #bildungsplan) — non-streaming
+    const lower = userText.toLowerCase();
+
+    // #wikipedia[:collection][:n]
+    if (
+      lower.includes("#wikipedia") || lower.includes("#wikipedia_de") ||
+      lower.includes("#wikipedia_en")
+    ) {
+      let collection = lang === "en"
+        ? "English-ConcatX-Abstract"
+        : "German-ConcatX-Abstract";
+      if (lower.includes("#wikipedia_de")) collection = "German-ConcatX-Abstract";
+      if (lower.includes("#wikipedia_en")) collection = "English-ConcatX-Abstract";
+
+      const parts = userText.split(":");
+      const q = (parts[1] ?? "").trim();
+      let n = 5;
+      if (parts.length > 2) n = parseInt((parts[2] ?? "5").trim(), 10) || 5;
+
+      const res = await fetchWikipedia(q, collection, n);
+      const out = (res || []).map((r: WikipediaResult, i: number) =>
+        `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${(res || []).length}**\n**${chatIslandContent[lang].wikipediaTitle}**: ${r.Title}\n**${chatIslandContent[lang].wikipediaURL}**: ${r.URL}\n**${chatIslandContent[lang].wikipediaContent}**: ${r.content}\n**${chatIslandContent[lang].wikipediaScore}**: ${r.score}`
+      ).join("\n\n");
+
+      setMessages((m) => [...m, { role: "assistant", content: out }]);
+      setIsStreamComplete(true);
+      return;
+    }
+
+    // #papers:query[:limit]
+    if (lower.includes("#papers")) {
+      const parts = userText.split(":");
+      const q = (parts[1] ?? "").trim();
+      let limit = 5;
+      if (parts.length > 2) limit = parseInt((parts[2] ?? "5").trim(), 10) || 5;
+
+      const res = await fetchPapers(q, limit);
+      const items = res?.payload?.items || [];
+      const out = items.map((it: PapersItem, i: number) => {
+        const authors = it.authors?.join(", ") || "";
+        const subjs = it.subjects?.join(", ") || "";
+        const papersTitle = chatIslandContent[lang].papersTitle ?? "Title";
+        const papersAuthors = chatIslandContent[lang].papersAuthors ?? "Authors";
+        const papersSubjects = chatIslandContent[lang].papersSubjects ?? "Subjects";
+        const papersAbstract = chatIslandContent[lang].papersAbstract ?? "Abstract";
+        const doiLabel = "DOI";
+        return `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${items.length}**\n**${papersTitle}**: ${it.title}\n**${papersAuthors}**: ${authors}\n**${papersSubjects}**: ${subjs}\n**${doiLabel}**: ${it.doi}\n**${papersAbstract}**: ${it.abstract}`;
+      }).join("\n\n");
+
+      setMessages((m) => [...m, { role: "assistant", content: out }]);
+      setIsStreamComplete(true);
+      return;
+    }
+
+    // #bildungsplan:query[:top_n]
+    if (lower.includes("#bildungsplan")) {
+      const parts = userText.split(":");
+      const q = (parts[1] ?? "").trim();
+      let top_n = 5;
+      if (parts.length > 2) top_n = parseInt((parts[2] ?? "5").trim(), 10) || 5;
+
+      const res = await fetchBildungsplan(q, top_n);
+      const results = res?.results || [];
+      const out = results.map((r, i) =>
+        `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${results.length}**\n${r.text}\n\n**Score**: ${r.score}`
+      ).join("\n\n");
+
+      setMessages((m) => [...m, { role: "assistant", content: out }]);
+      setIsStreamComplete(true);
+      return;
+    }
+
+    // === Streaming path (LLM) ===
+    const assistantGroupIndex = newMessagesArr.length; // where assistant message would appear
+    const ongoingStream: string[] = []; // buffer for sentence-boundary TTS
+    let currentAudioIndex = 1;
+
+    // Lazy draft controls
+    let createdDraft = false;
+    let gotAnyText = false;
+
+    const ensureDraft = () => {
+      if (!createdDraft) {
+        setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+        createdDraft = true;
       }
+    };
 
-      // Append chunk to the last assistant message's content STRING
+    const appendToAssistant = (txt: string) => {
       setMessages((prev) => {
+        if (!createdDraft) {
+          createdDraft = true;
+          return [...prev, { role: "assistant", content: txt }];
+        }
         const idx = prev.length - 1;
         const last = prev[idx];
         const prevText =
           typeof last.content === "string"
             ? last.content
             : Array.isArray(last.content)
-              ? (last.content as string[]).join("")
-              : "";
-        const updated = { ...last, content: prevText + chunk };
+            ? (last.content as string[]).join("")
+            : "";
+        const updated = { ...last, content: prevText + txt };
         return [...prev.slice(0, -1), updated];
       });
-    },
+    };
 
-    onerror(err: FatalError) {
-      setIsStreamComplete(true);
-      // Show the error appended into the same last assistant row
-      setMessages((prev) => {
-        const idx = prev.length - 1;
-        const last = prev[idx] || { role: "assistant", content: "" };
-        const prevText =
-          typeof last.content === "string"
-            ? last.content
-            : Array.isArray(last.content)
-              ? (last.content as string[]).join("")
-              : "";
-        const updated = { ...last, content: prevText + "\n\n" + String(err.message || err) };
-        return idx >= 0 ? [...prev.slice(0, -1), updated] : [updated];
-      });
-      throw err;
-    },
+    // Abort any previous stream, start a fresh controller
+    if (currentStreamAbortRef.current) currentStreamAbortRef.current.abort();
+    const ac = new AbortController();
+    currentStreamAbortRef.current = ac;
 
-    onclose() {
-      setIsStreamComplete(true);
-      setQuery("");
-      // Flush any remaining buffered sentence to TTS
-      const remaining = ongoingStream.join("").trim();
-      if (remaining) {
-        getTTS(remaining, newMessages.length, `stream${currentAudioIndex}`);
-      }
-    },
-  });
-};
+    await fetchEventSource("/api/chat", {
+      signal: ac.signal,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        lang,
+        messages: newMessagesArr,
+        universalApiKey: settings.universalApiKey,
+        llmApiUrl: settings.apiUrl,
+        llmApiKey: settings.apiKey,
+        llmApiModel: settings.apiModel,
+        vlmApiUrl: settings.vlmUrl,
+        vlmApiKey: settings.vlmKey,
+        vlmApiModel: settings.vlmModel,
+        vlmCorrectionModel: settings.vlmCorrectionModel,
+        systemPrompt: settings.systemPrompt,
+      }),
 
-  
+      // NOTE: we DO NOT create an assistant bubble here anymore
+      async onopen(response: Response) {
+        if (response.ok) return;
+        if (response.status !== 200) {
+          const errorText = await response.text().catch(() => "");
+          ensureDraft();
+          appendToAssistant(
+            `\n\n**BACKEND ERROR**\nStatuscode: ${response.status}\nMessage: ${
+              errorText || response.statusText
+            }`,
+          );
+          throw new FatalError(errorText || response.statusText);
+        }
+        throw new RetriableError();
+      },
+
+      onmessage(ev: EventSourceMessage) {
+        if (ev.event === "error") {
+          const err = (() => {
+            try {
+              return JSON.parse(ev.data);
+            } catch {
+              return { message: ev.data };
+            }
+          })();
+          ensureDraft();
+          appendToAssistant(
+            `\n\n**BACKEND ERROR**\nStatuscode: ${
+              err?.status ?? ""
+            }\nMessage: ${err?.message ?? ""}`,
+          );
+          return;
+        }
+        if (ev.event === "no_content") {
+          return; // explicit "nothing to show"
+        }
+
+        // Normal token
+        let chunk = "";
+        try {
+          chunk = JSON.parse(ev.data) as string; // server sends JSON.stringify(chunk)
+        } catch {
+          return;
+        }
+        if (!chunk) return;
+
+        gotAnyText = true;
+        ensureDraft();
+
+        // Buffer for TTS by sentence
+        ongoingStream.push(chunk);
+        const combined = ongoingStream.join("");
+
+        // speak when we hit a sentence-end that's not a decimal number boundary
+        const re = /(?<!\d)[.!?]/g;
+        let lastIdx = -1, m: RegExpExecArray | null;
+        while ((m = re.exec(combined)) !== null) lastIdx = m.index;
+        if (lastIdx !== -1) {
+          const split = lastIdx + 1;
+          const toSpeak = combined.slice(0, split).trim();
+          const remaining = combined.slice(split);
+          if (toSpeak) {
+            getTTS(toSpeak, assistantGroupIndex, `stream${currentAudioIndex}`);
+            currentAudioIndex++;
+          }
+          ongoingStream.length = 0;
+          if (remaining.trim()) ongoingStream.push(remaining);
+        }
+
+        // Append chunk to the assistant message's content STRING
+        appendToAssistant(chunk);
+      },
+
+      onerror(err: FatalError) {
+        setIsStreamComplete(true);
+        currentStreamAbortRef.current = null;
+        ensureDraft();
+        appendToAssistant(`\n\n${String(err?.message || err)}`);
+        throw err;
+      },
+
+      onclose() {
+        setIsStreamComplete(true);
+        currentStreamAbortRef.current = null;
+        setQuery("");
+
+        if (!gotAnyText) {
+          setMessages((prev) => {
+            if (!prev.length) return prev;
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant") {
+              const txt =
+                typeof last.content === "string"
+                  ? last.content
+                  : Array.isArray(last.content)
+                  ? (last.content as string[]).join("")
+                  : "";
+              if (!txt || txt.trim() === "") {
+                return prev.slice(0, -1); // drop the empty bubble
+              }
+            }
+            return prev;
+          });
+        } else {
+          const remaining = ongoingStream.join("").trim();
+          if (remaining) {
+            getTTS(remaining, assistantGroupIndex, `stream${currentAudioIndex}`);
+          }
+        }
+      },
+    });
+  };
+
   // 2. getTTS
   const getTTS = async (
     text: string,
@@ -849,21 +934,14 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
     // Only return early if readAlways is false AND this is a streaming request
     if (!readAlways && sourceFunction.startsWith("stream")) return;
 
-    console.log("[LOG] getTTS");
-    // console.log("text", text);
-    // console.log("chatIslandContent[lang][welcomeMessage]", chatIslandContent[lang]["welcomeMessage"]);
-    if (
-      text === chatIslandContent[lang]["welcomeMessage"]
-    ) {
+    if (text === chatIslandContent[lang]["welcomeMessage"]) {
       const audioFile = text === chatIslandContent["de"]["welcomeMessage"]
         ? "./intro.mp3"
         : "./intro-en.mp3";
       const audio = new Audio(audioFile);
-      // audioFileDict[groupIndex] = {
-      //   0: audio,
-      // };
-      const sourceFunctionIndex = Number(sourceFunction.replace("stream", "")) -
-          1 || 0;
+
+      const sourceFunctionIndex =
+        Number(sourceFunction.replace("stream", "")) - 1 || 0;
       if (audioFileDict[groupIndex]) {
         audioFileDict[groupIndex][sourceFunctionIndex] = {
           audio: audio,
@@ -877,7 +955,6 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
         };
       }
 
-      // all indices < groupIndex should be put to pause and added to stopList
       const newStopList = stopList;
       for (let i = 0; i < groupIndex; i++) {
         if (audioFileDict[i]) {
@@ -892,20 +969,8 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
       }
 
       setStopList(newStopList);
-
-      // // // TRYING DIFFERENT SETTER
       setAudioFileDict({ ...audioFileDict });
 
-      // // // WORKING SETTER
-      // setAudioFileDict((prev) => ({
-      //   ...prev,
-      //   [groupIndex]: audioFileDict[groupIndex],
-      // }));
-      // setAudioFileDict((prev) => ({ ...prev, [groupIndex]: audio }));
-      console.log(
-        "[LOG] Audio file loaded into audioQueue with groupIndex:",
-        groupIndex,
-      );
       if (sourceFunction === "handleOnSpeakAtGroupIndexAction") {
         handleOnSpeakAtGroupIndexAction(groupIndex);
       }
@@ -913,8 +978,6 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
     }
 
     try {
-      // // FOR PRODUCTION WHEN TTS SERVER IS WORKING
-      console.log("text for /api/tts", sourceFunction, text);
       const response = await fetch("/api/tts", {
         method: "POST",
         headers: {
@@ -927,7 +990,7 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
           ttsKey: settings.ttsKey,
           ttsUrl: settings.ttsUrl,
           ttsModel: settings.ttsModel,
-          universalApiKey: settings.universalApiKey, 
+          universalApiKey: settings.universalApiKey,
         }),
       });
 
@@ -1007,10 +1070,10 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
   const stopAndResetAudio = () => {
     (Object.values(audioFileDict) as Record<number, AudioItem>[]).forEach(
       (group) => {
-        (Object.values(group) as AudioItem[]).forEach((item: AudioItem) => { // Changed from (audio)
-          if (!item.audio.paused) { // Changed from !audio.paused
-            item.audio.pause(); // Changed from audio.pause()
-            item.audio.currentTime = 0; // Changed from audio.currentTime
+        (Object.values(group) as AudioItem[]).forEach((item: AudioItem) => {
+          if (!item.audio.paused) {
+            item.audio.pause();
+            item.audio.currentTime = 0;
           }
         });
       },
@@ -1031,16 +1094,16 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
       ...localStorageKeys.map((key) => Number(key.slice(10))),
     );
     const newChatSuffix = String(Number(maxValueInChatSuffix) + 1);
-    // console.log([...localStorageKeys, "bude-chat-" + newChatSuffix]);
     setMessages([
       {
-        "role": "assistant",
-        "content": [
+        role: "assistant",
+        content: [
           chatIslandContent[lang]["welcomeMessage"],
         ],
       },
     ]);
     setCurrentChatSuffix(newChatSuffix);
+    resetComposerHeight(); // ensure composer height is normal in a new chat
   };
 
   // 2. deleteCurrentChat
@@ -1061,14 +1124,15 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
     } else {
       setMessages([
         {
-          "role": "assistant",
-          "content": [
+          role: "assistant",
+          content: [
             chatIslandContent[lang]["welcomeMessage"],
           ],
         },
       ]);
     }
     stopAndResetAudio();
+    resetComposerHeight(); // reset composer size
   };
 
   // 3. deleteAllChats
@@ -1076,8 +1140,8 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
     localStorage.clear();
     setMessages([
       {
-        "role": "assistant",
-        "content": [
+        role: "assistant",
+        content: [
           chatIslandContent[lang]["welcomeMessage"],
         ],
       },
@@ -1085,6 +1149,7 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
     setLocalStorageKeys([]);
     setCurrentChatSuffix("0");
     stopAndResetAudio();
+    resetComposerHeight(); // reset composer size
   };
 
   // 4. saveChatsToLocalFile
@@ -1133,6 +1198,7 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
         );
         setCurrentChatSuffix(newChatSuffix);
         setMessages(chats["bude-chat-" + newChatSuffix]);
+        resetComposerHeight(); // keep composer at fixed height after restore
       } catch (error) {
         console.error("Error parsing JSON file:", error);
       }
@@ -1261,12 +1327,14 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
           </svg>
         </button>
       </div>
+
       <ChatTemplate
         lang={lang}
         parentImages={images}
-        parentPdfs={pdfs} 
+        parentPdfs={pdfs}
         messages={messages}
         isComplete={isStreamComplete}
+        onCancelAction={cancelStream}
         readAlways={readAlways}
         autoScroll={autoScroll}
         audioFileDict={audioFileDict}
@@ -1294,33 +1362,25 @@ const startStream = async (transcript: string, prevMessages?: Message[]) => {
           (settings.apiKey && settings.apiModel && settings.apiUrl)
         ? (
           <div className="relative mt-4 mb-12">
-          <textarea
-            type="text"
-            value={query}
-            placeholder={chatIslandContent[lang]["placeholderText"]}
-            onInput={(e) => {
-              const textarea = e.currentTarget;
-              textarea.style.height = "auto";
-              textarea.style.height = textarea.scrollHeight + "px";
-              setQuery(e.currentTarget.value);
-            }}
-            onKeyPress={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                startStream("");
-              }
-            }}
-            class="h-auto w-full min-h-[12.5rem] py-4 pl-4 pr-16 border border-gray-300 rounded-lg focus:outline-none cursor-text focus:border-orange-200 focus:ring-1 focus:ring-orange-300 shadow-sm resize-none placeholder-gray-400 text-base font-medium overflow-hidden"
-          />
-
-            <ImageUploadButton
-              onImagesUploaded={handleImagesUploaded}
+            <textarea
+              ref={composeRef}
+              type="text"
+              value={query}
+              placeholder={chatIslandContent[lang]["placeholderText"]}
+              onInput={handleComposerInput}
+              onKeyPress={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  startStream("");
+                }
+              }}
+              class="h-48 w-full py-4 pl-4 pr-16 border border-gray-300 rounded-lg
+                     focus:outline-none cursor-text focus:border-orange-200 focus:ring-1 focus:ring-orange-300
+                     shadow-sm resize-none overflow-auto placeholder-gray-400 text-base font-medium"
             />
 
-
-            <PdfUploadButton
-              onPdfsUploaded={handlePdfsUploaded}
-            />
+            <ImageUploadButton onImagesUploaded={handleImagesUploaded} />
+            <PdfUploadButton onPdfsUploaded={handlePdfsUploaded} />
 
             <VoiceRecordButton
               resetTranscript={resetTranscript}

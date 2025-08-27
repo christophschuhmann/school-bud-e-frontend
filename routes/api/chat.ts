@@ -48,19 +48,31 @@ function extractAssistantText(anyJson: any): string {
   return "";
 }
 
-/** Turn plain text into a minimal OpenAI-style SSE stream for our UI */
+/** Turn plain text into a minimal OpenAI-style SSE stream for our UI
+ *  NOTE: Wenn kein Text vorhanden ist, senden wir KEIN roles-Delta,
+ *  sondern ein eigenes Event 'no_content', damit die UI keinen leeren
+ *  Assistenten-Ballon rendert.
+ */
 function sseFromText(text: string): ReadableStream<Uint8Array> {
   const enc = new TextEncoder();
+  if (!text || !text.length) {
+    const noContent = `event: no_content\ndata: {}\n\n`;
+    const end = `data: [DONE]\n\n`;
+    return new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc.encode(noContent));
+        controller.enqueue(enc.encode(end));
+        controller.close();
+      },
+    });
+  }
   const start = `data: ${JSON.stringify({ choices: [{ delta: { role: "assistant" } }] })}\n\n`;
-  const body =
-    text && text.length
-      ? `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`
-      : "";
+  const body = `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`;
   const end = `data: [DONE]\n\n`;
   return new ReadableStream({
     start(controller) {
       controller.enqueue(enc.encode(start));
-      if (body) controller.enqueue(enc.encode(body));
+      controller.enqueue(enc.encode(body));
       controller.enqueue(enc.encode(end));
       controller.close();
     },
@@ -99,49 +111,48 @@ async function getModelResponseStream(
   vlmCorrectionModel: string,
   wantsStream: boolean | undefined, // NEW
 ) {
+  const MIDDLEWARE_BASE_URL = "http://65.109.157.234:8787";
 
-    const MIDDLEWARE_BASE_URL = "http://65.109.157.234:8787";
-
-  // If a universal key is provided, it ALWAYS overrides the other URLs
-  // to point to your central middleware.
+  // If a universal key is provided, override URLs to the middleware.
   if (universalApiKey) {
     llmApiUrl = `${MIDDLEWARE_BASE_URL}/v1/chat/completions`;
-    vlmApiUrl = `${MIDDLEWARE_BASE_URL}/v1/chat/completions`; // VLM uses the same endpoint
+    vlmApiUrl = `${MIDDLEWARE_BASE_URL}/v1/chat/completions`;
     llmApiKey = universalApiKey;
     vlmApiKey = universalApiKey;
   }
-  // 1) Universal-Key Gate (wie zuvor)
+
+  // 1) Universal key format check
   if (universalApiKey !== "" && !universalApiKey.toLowerCase().startsWith("sbe-")) {
     return new Response("Invalid Universal API Key. It needs to start with 'sbe-'.", { status: 400 });
   }
 
-  // 2) Trailing assistant messages entfernen (wie zuvor)
+  // 2) Strip trailing assistant messages
   let isLastAssistant = messages[messages.length - 1]?.role === "assistant";
   while (isLastAssistant) {
     messages.pop();
     isLastAssistant = messages[messages.length - 1]?.role === "assistant";
   }
 
-  // 3) Korrektur-Flag
+  // 3) Correction flag
   const isCorrectionInLastMessage = hasKorrekturHashtag(messages);
 
-  // 4) Systemprompt wählen
+  // 4) System prompt
   let useThisSystemPrompt = isCorrectionInLastMessage
     ? chatContent[lang].correctionSystemPrompt
     : chatContent[lang].systemPrompt;
   if (systemPrompt != "") useThisSystemPrompt = systemPrompt;
   messages.unshift({ role: "system", content: useThisSystemPrompt });
 
-  // 5) Multimodalität erkennen
-  const isImageInMessages = messages.some((m) =>
-    Array.isArray(m.content) && m.content.some((p: any) => p.type === "image_url")
+  // 5) Multimodality detection
+  const isImageInMessages = messages.some(
+    (m) => Array.isArray(m.content) && m.content.some((p: any) => p.type === "image_url"),
   );
-  const isPdfInMessages = messages.some((m) =>
-    Array.isArray(m.content) && m.content.some((p: any) => p.type === "pdf")
+  const isPdfInMessages = messages.some(
+    (m) => Array.isArray(m.content) && m.content.some((p: any) => p.type === "pdf"),
   );
 
-  // 6) PDF → Gemini
-  if (isPdfInMessages) {
+  // 6) Direct PDF → Gemini only when NO universal key (otherwise middleware handles PDFs)
+  if (isPdfInMessages && !(universalApiKey && universalApiKey.trim().length > 0)) {
     const geminiApiKey = vlmApiKey || Deno.env.get("VLM_KEY") || "";
     const geminiModel = vlmApiModel || Deno.env.get("VLM_MODEL") || "gemini-2.5-pro";
     if (!geminiApiKey) {
@@ -165,7 +176,6 @@ async function getModelResponseStream(
         }
       : undefined;
 
-    // Gemini-contents
     const geminiContents = messages
       .filter((m) => m.role !== "system")
       .map((m) => {
@@ -191,9 +201,7 @@ async function getModelResponseStream(
         return { role: m.role === "assistant" ? "model" : "user", parts };
       });
 
-    // Stream- oder Non-Stream-Weg
     if (wantsStream !== false) {
-      // SSE-Streaming
       const geminiUrl =
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}` +
         `:streamGenerateContent?alt=sse&key=${encodeURIComponent(geminiApiKey)}`;
@@ -202,10 +210,9 @@ async function getModelResponseStream(
         contents: geminiContents,
         generationConfig: { thinkingConfig: { thinkingBudget: -1 } },
         tools: [{ googleSearch: {} }],
+        ...(systemInstruction ? { systemInstruction } : {}),
       };
-      if (systemInstruction) geminiBody.systemInstruction = systemInstruction;
 
-      // Textrekursion aus SSE-Events
       function collectTextFields(obj: any, out: string[]) {
         if (!obj) return;
         if (typeof obj === "object") {
@@ -220,28 +227,71 @@ async function getModelResponseStream(
       return new Response(
         new ReadableStream({
           async start(controller) {
+            let closed = false;
+            let sentAny = false;
+            const finish = () => {
+              if (closed) return;
+              // Wenn kein Text kam: no_content signalisieren
+              if (!sentAny) {
+                controller.enqueue({ event: "no_content", data: "{}", id: Date.now() });
+              }
+              closed = true;
+              controller.close();
+            };
+
             try {
-              const resp = await fetch(geminiUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(geminiBody) });
+              const resp = await fetch(geminiUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(geminiBody),
+              });
+
               if (!resp.ok || !resp.body) {
-                controller.error(new Error(`Gemini API error: ${resp.status} ${resp.statusText}`));
-                controller.close();
+                const errText = await resp.text().catch(() => "");
+                controller.enqueue({
+                  event: "error",
+                  data: JSON.stringify({
+                    provider: "gemini",
+                    model: geminiModel,
+                    status: resp.status,
+                    message: errText || resp.statusText || "Upstream error",
+                  }),
+                  id: Date.now(),
+                });
+                controller.enqueue({ data: "[DONE]", event: "message", id: Date.now() });
+                finish();
                 return;
               }
+
               const reader = resp.body.getReader();
               const decoder = new TextDecoder();
               let buffer = "";
-              while (true) {
+              let currentEvent = "message";
+
+              readLoop: while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split("\n");
                 buffer = lines.pop() || "";
-                for (const line of lines) {
+
+                for (const raw of lines) {
+                  const line = raw.trimEnd();
+                  if (line.startsWith("event: ")) {
+                    currentEvent = line.slice(7).trim() || "message";
+                    continue;
+                  }
                   if (!line.startsWith("data: ")) continue;
+
                   const payload = line.slice(6).trim();
                   if (payload === "[DONE]") {
-                    controller.close();
-                    break;
+                    finish();
+                    break readLoop;
+                  }
+                  if (currentEvent === "error") {
+                    controller.enqueue({ event: "error", data: payload, id: Date.now() });
+                    currentEvent = "message";
+                    continue;
                   }
                   try {
                     const json = JSON.parse(payload);
@@ -249,33 +299,60 @@ async function getModelResponseStream(
                     collectTextFields(json, parts);
                     const chunk = parts.join("");
                     if (chunk) {
+                      sentAny = true;
                       controller.enqueue({ data: JSON.stringify(chunk), id: Date.now(), event: "message" });
                     }
-                  } catch (_) { /* ignore */ }
+                  } catch {
+                    // ignore
+                  }
                 }
               }
-              controller.close();
-            } catch (_) {
-              controller.close();
+              finish();
+            } catch (e: any) {
+              controller.enqueue({
+                event: "error",
+                data: JSON.stringify({
+                  provider: "gemini",
+                  model: geminiModel,
+                  status: 502,
+                  message: String(e?.message || e || "Network error"),
+                }),
+                id: Date.now(),
+              });
+              controller.enqueue({ data: "[DONE]", event: "message", id: Date.now() });
+              finish();
+            }
+          },
+          cancel(err) {
+            // Silence normal closures; log only unexpected ones.
+            const s = String(err || "").toLowerCase();
+            if (err && !s.includes("resource closed") && !s.includes("aborterror")) {
+              console.warn("SSE canceled:", err);
             }
           },
         }).pipeThrough(new ServerSentEventStream()),
         { headers: { "Content-Type": "text/event-stream" } },
       );
     } else {
-      // Non-Stream: /generateContent + JSON zurück
       const url =
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}` +
         `:generateContent?key=${encodeURIComponent(geminiApiKey)}`;
-      const body = { contents: geminiContents };
-      if (systemInstruction) (body as any).systemInstruction = systemInstruction;
+      const body = {
+        contents: geminiContents,
+        generationConfig: { thinkingConfig: { thinkingBudget: -1 } },
+        tools: [{ googleSearch: {} }],
+        ...(systemInstruction ? { systemInstruction } : {}),
+      };
       const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      const j = await r.json();
-      return new Response(JSON.stringify(j), { status: r.status, headers: { "Content-Type": "application/json" } });
+      const txt = await r.text();
+      return new Response(txt, {
+        status: r.status,
+        headers: { "Content-Type": r.headers.get("content-type") ?? "application/json" },
+      });
     }
   }
 
-  // 7) LLM/VLM (kein PDF) → Upstream (typischerweise deine Middleware)
+  // 7) LLM/VLM (no PDF) → upstream (middleware or direct)
   let useApiUrl = llmApiUrl || Deno.env.get("LLM_URL") || API_URL;
   let useApiKey = llmApiKey || Deno.env.get("LLM_KEY") || API_KEY;
   let useApiModel = llmApiModel || Deno.env.get("LLM_MODEL") || API_MODEL;
@@ -284,96 +361,174 @@ async function getModelResponseStream(
     useApiUrl = vlmApiUrl || Deno.env.get("VLM_URL") || API_IMAGE_URL;
     useApiKey = vlmApiKey || Deno.env.get("VLM_KEY") || API_IMAGE_KEY;
     const chosenVlmModel =
-      (isCorrectionInLastMessage && vlmCorrectionModel)
+      isCorrectionInLastMessage && vlmCorrectionModel
         ? vlmCorrectionModel
         : vlmApiModel || Deno.env.get("VLM_MODEL") || API_IMAGE_MODEL;
     useApiModel = chosenVlmModel;
   }
 
-  // Non-Stream explizit angefordert → JSON 1:1
+  // Non-stream: pass JSON straight through
   if (wantsStream === false) {
     const resp = await fetch(useApiUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${useApiKey}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${useApiKey}` },
       body: JSON.stringify({ model: useApiModel, stream: false, messages }),
     });
-    const txt = await resp.text(); // JSON oder Fehler durchreichen
-    return new Response(txt, { status: resp.status, headers: { "Content-Type": resp.headers.get("content-type") ?? "application/json" } });
+    const txt = await resp.text();
+    return new Response(txt, {
+      status: resp.status,
+      headers: { "Content-Type": resp.headers.get("content-type") ?? "application/json" },
+    });
   }
 
-  // Standard: Stream anfordern und 1:1 durchreichen – oder bei JSON auf Mini-SSE fallen
+  // Stream: request SSE and forward
   return new Response(
     new ReadableStream({
       async start(controller) {
+        let closed = false;
+        let sentAny = false;
+        const finish = () => {
+          if (closed) return;
+          if (!sentAny) {
+            controller.enqueue({ event: "no_content", data: "{}", id: Date.now() });
+          }
+          closed = true;
+          controller.close();
+        };
+
         try {
           const upstream = await fetch(useApiUrl, {
             method: "POST",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${useApiKey}` },
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${useApiKey}` },
             body: JSON.stringify({ model: useApiModel, stream: true, messages }),
           });
 
-          if (!upstream.ok) {
-            controller.error(new Error(`Upstream error: ${upstream.status} ${upstream.statusText}`));
-            controller.close();
+          if (!upstream.ok || !upstream.body) {
+            const errText = await upstream.text().catch(() => "");
+            controller.enqueue({
+              event: "error",
+              data: JSON.stringify({
+                provider: "middleware",
+                model: useApiModel,
+                status: upstream.status,
+                message: errText || upstream.statusText || "Upstream error",
+              }),
+              id: Date.now(),
+            });
+            controller.enqueue({ data: "[DONE]", event: "message", id: Date.now() });
+            finish();
             return;
           }
 
           const ctype = (upstream.headers.get("content-type") || "").toLowerCase();
           const isSSE = ctype.includes("text/event-stream");
-          if (!upstream.body) {
-            controller.close();
-            return;
-          }
-
           const decoder = new TextDecoder();
 
           if (isSSE) {
-            // 1:1 SSE → UI-SSE mapping (delta.content → JSON-String)
             const reader = upstream.body.getReader();
             let buffer = "";
-            while (true) {
+            let currentEvent = "message";
+
+            readLoop: while (true) {
               const { done, value } = await reader.read();
               if (done) break;
               buffer += decoder.decode(value, { stream: true });
               const lines = buffer.split("\n");
               buffer = lines.pop() || "";
-              for (const line of lines) {
+
+              for (const raw of lines) {
+                const line = raw.trimEnd();
+
                 if (line === "data: [DONE]") {
-                  controller.close();
+                  finish();
+                  continue;
+                }
+                if (line.startsWith("event: ")) {
+                  currentEvent = line.slice(7).trim() || "message";
                   continue;
                 }
                 if (!line.startsWith("data: ")) continue;
+
                 const jsonStr = line.substring(6);
+
+                if (currentEvent === "error") {
+                  controller.enqueue({ event: "error", data: jsonStr, id: Date.now() });
+                  currentEvent = "message";
+                  continue;
+                }
+
                 try {
                   const data = JSON.parse(jsonStr);
                   const delta = data?.choices?.[0]?.delta;
                   if (delta?.content !== undefined && delta?.content !== null) {
-                    if (delta.content === "<|im_end|>") controller.close();
-                    else controller.enqueue({ data: JSON.stringify(delta.content), id: Date.now(), event: "message" });
+                    if (delta.content === "<|im_end|>") {
+                      finish();
+                    } else {
+                      sentAny = true;
+                      controller.enqueue({ data: JSON.stringify(delta.content), id: Date.now(), event: "message" });
+                    }
                   }
-                } catch (_) { /* ignore */ }
+                  if (data?.error) {
+                    controller.enqueue({ event: "error", data: JSON.stringify(data.error), id: Date.now() });
+                  }
+                } catch {
+                  if (jsonStr.toLowerCase().includes("error")) {
+                    controller.enqueue({ event: "error", data: JSON.stringify({ message: jsonStr }), id: Date.now() });
+                  }
+                }
               }
             }
-            controller.close();
+            finish();
           } else {
-            // Kein SSE → JSON lesen, Text extrahieren → Mini-SSE an UI
+            // Non-SSE fallback → convert JSON to mini-SSE
             const raw = await upstream.text();
             let text = "";
-            try { text = extractAssistantText(JSON.parse(raw)); } catch (_) { text = raw; }
+            try {
+              text = extractAssistantText(JSON.parse(raw));
+            } catch {
+              text = raw;
+            }
             const stream = sseFromText(text);
             const reader = stream.getReader();
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
+              // sseFromText sendet bei leerem Text 'event: no_content'
+              // und bei nicht-leerem Text role+content.
               controller.enqueue(value);
+              if (!sentAny) {
+                // Heuristik: sobald irgendein content-Frame kam, markiere sentAny
+                // (role-Delta kommt nur wenn Text existiert).
+                // Wir setzen sentAny true, wenn der Chunk einen content trägt.
+                try {
+                  const s = new TextDecoder().decode(value);
+                  if (s.includes('"content"')) sentAny = true;
+                } catch {}
+              }
             }
-            controller.close();
+            finish();
           }
-        } catch (_) {
-          controller.close();
+        } catch (e: any) {
+          controller.enqueue({
+            event: "error",
+            data: JSON.stringify({
+              provider: "middleware",
+              model: useApiModel,
+              status: 502,
+              message: String(e?.message || e || "Network error"),
+            }),
+            id: Date.now(),
+          });
+          controller.enqueue({ data: "[DONE]", event: "message", id: Date.now() });
+          finish();
         }
       },
-      cancel(err) { console.log("SSE canceled:", err); },
+      cancel(err) {
+        const s = String(err || "").toLowerCase();
+        if (err && !s.includes("resource closed") && !s.includes("aborterror")) {
+          console.warn("SSE canceled:", err);
+        }
+      },
     }).pipeThrough(new ServerSentEventStream()),
     { headers: { "Content-Type": "text/event-stream" } },
   );
@@ -381,9 +536,9 @@ async function getModelResponseStream(
 // --- REPLACE THE WHOLE FUNCTION ENDING HERE ---
 
 export const handler: Handlers = {
+  // Canonical entry: POST with JSON payload
   async POST(req: Request) {
     const payload = await req.json();
-    // wantsStream: true (default) – wenn payload.stream explizit false ist, geben wir JSON zurück
     const wantsStream: boolean | undefined = payload.stream;
     return getModelResponseStream(
       payload.messages as Message[],
@@ -395,5 +550,73 @@ export const handler: Handlers = {
       wantsStream,
     );
   },
+
+  // Allow GET (some clients/openers use EventSource or trigger GET accidentally)
+  // Accepts ?payload=<base64(json)> — if missing/invalid, return SSE error with guidance.
+  async GET(req: Request) {
+    const url = new URL(req.url);
+    const payloadParam = url.searchParams.get("payload");
+    if (!payloadParam) {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              `event: error\ndata: ${JSON.stringify({
+                status: 405,
+                message: "Use POST with JSON body or GET with ?payload=<base64(json)>",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(new TextEncoder().encode(`data: [DONE]\n\n`));
+          controller.close();
+        },
+      });
+      return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
+    }
+
+    let payload: any;
+    try {
+      const jsonStr = atob(payloadParam);
+      payload = JSON.parse(jsonStr);
+    } catch {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              `event: error\ndata: ${JSON.stringify({
+                status: 400,
+                message: "Invalid ?payload. Must be base64-encoded JSON.",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(new TextEncoder().encode(`data: [DONE]\n\n`));
+          controller.close();
+        },
+      });
+      return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
+    }
+
+    const wantsStream: boolean | undefined = payload.stream;
+    return getModelResponseStream(
+      payload.messages as Message[],
+      payload.lang,
+      payload.universalApiKey,
+      payload.llmApiUrl, payload.llmApiKey, payload.llmApiModel,
+      payload.systemPrompt,
+      payload.vlmApiUrl, payload.vlmApiKey, payload.vlmApiModel, payload.vlmCorrectionModel,
+      wantsStream,
+    );
+  },
+
+  // Handle preflight cleanly to avoid 405 on OPTIONS
+  async OPTIONS(_req: Request) {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      },
+    });
+  },
 };
- 
