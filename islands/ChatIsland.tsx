@@ -108,6 +108,27 @@ export default function ChatIsland({ lang }: { lang: string }) {
   // NEW: pending manual speak groups (autostart when first chunk arrives)
   const [pendingManualSpeak, setPendingManualSpeak] = useState<Set<number>>(new Set());
 
+  // ---------- TTS concurrency pool (NEW) ----------
+  const TTS_POOL_LIMIT = 6;
+  const ttsActiveRef = useRef(0);
+  const ttsQueueRef = useRef<(() => Promise<void>)[]>([]);
+  const pumpTtsQueue = () => {
+    while (ttsActiveRef.current < TTS_POOL_LIMIT && ttsQueueRef.current.length) {
+      const job = ttsQueueRef.current.shift()!;
+      ttsActiveRef.current++;
+      job()
+        .catch((e) => console.error("TTS job error:", e))
+        .finally(() => {
+          ttsActiveRef.current--;
+          pumpTtsQueue();
+        });
+    }
+  };
+  const scheduleTTSJob = (fn: () => Promise<void>) => {
+    ttsQueueRef.current.push(fn);
+    pumpTtsQueue();
+  };
+
   // ---------- Persistence helper (immediate & safe) ----------
   const safePersist = (msgs: Message[], suffix: string) => {
     try {
@@ -123,6 +144,26 @@ export default function ChatIsland({ lang }: { lang: string }) {
         console.warn("Failed to persist messages:", e);
       }
     }
+  };
+  // Throttled persist (NEW – used during streaming)
+  const persistThrottleRef = useRef<{ timer?: number; pending?: { msgs: Message[]; suffix: string } }>({});
+  const safePersistThrottled = (msgs: Message[], suffix: string) => {
+    persistThrottleRef.current.pending = { msgs, suffix };
+    if (persistThrottleRef.current.timer) return;
+    persistThrottleRef.current.timer = window.setTimeout(() => {
+      const p = persistThrottleRef.current.pending;
+      if (p) safePersist(p.msgs, p.suffix);
+      if (persistThrottleRef.current.timer) clearTimeout(persistThrottleRef.current.timer);
+      persistThrottleRef.current.timer = undefined;
+      persistThrottleRef.current.pending = undefined;
+    }, 250);
+  };
+  const flushPersistThrottle = () => {
+    const p = persistThrottleRef.current.pending;
+    if (p) safePersist(p.msgs, p.suffix);
+    if (persistThrottleRef.current.timer) clearTimeout(persistThrottleRef.current.timer);
+    persistThrottleRef.current.timer = undefined;
+    persistThrottleRef.current.pending = undefined;
   };
   // -----------------------------------------------------------
 
@@ -349,7 +390,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
 
   // 6) Flush latest messages just before unload / when tab becomes hidden
   useEffect(() => {
-    const flush = () => safePersist(messages, currentChatSuffix);
+    const flush = () => { flushPersistThrottle(); safePersist(messages, currentChatSuffix); };
     const vis = () => {
       if (document.visibilityState === "hidden") flush();
     };
@@ -406,7 +447,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
     setAudioFileDict_({ ...audioFileDict_ });
   };
 
-  // ---------- Smart Chunking (unchanged core) ----------
+  // ---------- Smart Chunking ----------
   const countWords = (s: string) => (s.trim().match(/[^\s]+/g) ?? []).length;
 
   // "." is only valid as sentence end if left token isn't a number or single-letter enum
@@ -427,7 +468,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
     let i = start;
     while (i < text.length) {
       const ch = text[i];
-      // only consider boundaries after minWords in the current slice
       const wordsSoFar = countWords(text.slice(start, i + 1));
       if (wordsSoFar >= minWords) {
         if (i + 2 < text.length && text.slice(i, i + 3) === "...") return i + 3;
@@ -676,7 +716,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
       return cp;
     });
 
-    // fire *all* chunks concurrently
+    // fire *all* chunks concurrently (queued in TTS pool)
     chunks.forEach((chunk, i) => {
       getTTS(chunk, groupIndex, `manual_stream${i + 1}`);
     });
@@ -767,7 +807,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
     setImages(images_);
   };
 
-  // ======= TTS CLEANING (NEW) =======
+  // ======= TTS CLEANING =======
   // Remove asterisks and emoji characters (keep words intact)
   const cleanForTTS = (s: string) =>
     s
@@ -779,73 +819,73 @@ export default function ChatIsland({ lang }: { lang: string }) {
       )
       .replace(/\s{2,}/g, " ");
 
-  // ======= THINK TAG STREAM FILTER (NEW) =======
-  // Incremental filter that hides <think>...</think> blocks from both UI and TTS.
+  // ======= THINK TAG STREAM FILTER (UPDATED) =======
   type ThinkState = { inThink: boolean; carry: string };
   const makeThinkFilter = () => {
+    const CARRY_OPEN = 16;
+    const CARRY_CLOSE = 16;
     const state: ThinkState = { inThink: false, carry: "" };
-    return (chunk: string): string => {
+
+    const consume = (chunk: string): string => {
       let s = state.carry + chunk;
       let out = "";
       let i = 0;
-      const lower = () => s.toLowerCase();
+
+      const lowerAt = (from: number) => s.slice(from).toLowerCase();
 
       while (i < s.length) {
         if (!state.inThink) {
-          const L = lower();
-          let j = L.indexOf("<think", i);
-          if (j === -1) {
-            // output everything except possible start of "<think"
-            const keepTail = Math.max(0, s.length - 6);
+          const L = lowerAt(i);
+          const rel = L.indexOf("<think");
+          if (rel === -1) {
+            const keepTail = Math.max(0, s.length - CARRY_OPEN);
             out += s.slice(i, keepTail);
             state.carry = s.slice(keepTail);
-            i = s.length;
             break;
           } else {
-            // output text before the tag
+            const j = i + rel;
             out += s.slice(i, j);
-            // find end of opening tag
-            const k = s.indexOf(">", j);
-            if (k === -1) {
-              // incomplete opening tag -> carry
+            const end = s.indexOf(">", j);
+            if (end === -1) {
               state.carry = s.slice(j);
-              i = s.length;
               break;
-            } else {
-              state.inThink = true;
-              i = k + 1; // skip "<think...>"
             }
+            state.inThink = true;
+            i = end + 1;
           }
         } else {
-          // inside think: skip until closing
-          const L = lower();
-          let j = L.indexOf("</think", i);
-          if (j === -1) {
-            // keep tail that might contain start of closing tag
-            const keepTail = Math.max(0, s.length - 8);
-            state.carry = s.slice(keepTail);
-            i = s.length;
+          const L = lowerAt(i);
+          const rel = L.indexOf("</think");
+          if (rel === -1) {
+            const keepTail = Math.max(0, s.length - CARRY_CLOSE);
+            state.carry = s.slice(i >= s.length ? s.length : keepTail);
             break;
           } else {
-            const k = s.indexOf(">", j);
-            if (k === -1) {
+            const j = i + rel;
+            const end = s.indexOf(">", j);
+            if (end === -1) {
               state.carry = s.slice(j);
-              i = s.length;
               break;
-            } else {
-              state.inThink = false;
-              i = k + 1; // resume output after closing tag
             }
+            state.inThink = false;
+            i = end + 1;
           }
         }
       }
-
-      // if finished and not in a tag, clear carry (we already preserved possible prefix)
-      if (!state.inThink && i === s.length && state.carry && !state.carry.startsWith("<")) {
-        // safety: if carry doesn't look like a tag start, flush it out next time via prefix logic
-      }
       return out;
     };
+
+    const flush = (): string => {
+      if (!state.inThink && state.carry) {
+        const tail = state.carry;
+        state.carry = "";
+        return tail;
+      }
+      state.carry = ""; // discard if still inside <think>
+      return "";
+    };
+
+    return { consume, flush };
   };
 
   // BILDUNGSPLAN
@@ -1098,7 +1138,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
     let autoTriggered = false;
 
     // Lazy draft controls
-    let createdDraft = false;
+    let createdDraft: boolean = false;
     let gotAnyText = false;
 
     // NEW: build a think filter instance for this stream
@@ -1109,7 +1149,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
         createdDraft = true;
         setMessages((prev) => {
           const next = [...prev, { role: "assistant", content: "" }];
-        safePersist(next, currentChatSuffix);
+          safePersist(next, currentChatSuffix);
           return next;
         });
       }
@@ -1134,7 +1174,8 @@ export default function ChatIsland({ lang }: { lang: string }) {
               : "";
         const updated = { ...last, content: prevText + txt };
         const next = [...prev.slice(0, -1), updated];
-        safePersist(next, currentChatSuffix);
+        // Throttle during streaming (NEW)
+        safePersistThrottled(next, currentChatSuffix);
         return next;
       });
     };
@@ -1198,7 +1239,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
         if (!rawChunk) return;
 
         // Filter THINK tokens incrementally (affects both UI and TTS)
-        const chunk = filterThink(rawChunk);
+        const chunk = filterThink.consume(rawChunk);
         if (!chunk) return; // If entire piece was think-only, skip fully.
 
         gotAnyText = true;
@@ -1241,6 +1282,20 @@ export default function ChatIsland({ lang }: { lang: string }) {
       onclose() {
         setIsStreamComplete(true);
         setQuery("");
+
+        // Flush any safe carry left in the think-filter (NEW)
+        const tailVisible = (() => {
+          try { return makeThinkFilter().flush(); } catch { return ""; }
+        })(); // dummy; but we need the real instance:
+        // Correct usage: call flush on the actual filter instance
+        const flushed = filterThink.flush();
+        if (flushed) {
+          appendToAssistant(flushed);
+          ongoingStream.push(flushed);
+        }
+
+        // Ensure throttled persist is written now (NEW)
+        flushPersistThrottle();
 
         if (!gotAnyText) {
           setMessages((prev) => {
@@ -1332,7 +1387,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
     });
   };
 
-  // 2. getTTS  (MODIFIED: supports manual_streamN + robust chaining + CLEANING)
+  // 2. getTTS  (MODIFIED: supports manual_streamN + robust chaining + CLEANING + POOL)
   const getTTS = async (
     text: string,
     groupIndex: number,
@@ -1391,74 +1446,77 @@ export default function ChatIsland({ lang }: { lang: string }) {
       return;
     }
 
-    try {
-      const response = await fetch("/api/tts", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          text: ttsText,                   // cleaned!
-          textPosition: sourceFunction,
-          voice: lang === "en" ? "Stefanie" : "Florian",
-          ttsKey: settings.ttsKey,
-          ttsUrl: settings.ttsUrl,
-          ttsModel: settings.ttsModel,
-          universalApiKey: settings.universalApiKey,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const audioData = await response.arrayBuffer();
-      const audioBlob = new Blob([audioData], { type: "audio/wav" });
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audio = new Audio(audioUrl) as HTMLAudioElement & { __text?: string };
-      audio.__text = text; // keep original (with stars/emojis) for regen checks
-
-      // ensure group slot
-      if (!audioFileDict[groupIndex]) audioFileDict[groupIndex] = {};
-
-      // compute index for both "streamN" and "manual_streamN"
-      const idx = indexFromSourceFunction(sourceFunction);
-
-      audioFileDict[groupIndex][idx] = {
-        audio: audio,
-        played: false,
-      };
-
-      // dynamic chaining: link to previous if exists, and link this to next (when present later)
-      wireNeighborChaining(groupIndex, idx);
-      audio.onended = () => {
-        const next = audioFileDict[groupIndex]?.[idx + 1]?.audio;
-        if (next) next.play();
-        setAudioFileDict({ ...audioFileDict });
-      };
-
-      setAudioFileDict((prev) => ({
-        ...prev,
-        [groupIndex]: audioFileDict[groupIndex],
-      }));
-
-      // manual first chunk arrived → autostart
-      if (sourceFunction.startsWith("manual_")) {
-        setPendingManualSpeak((prev) => {
-          const group = audioFileDict[groupIndex] || {};
-          const firstReady = !!group[0]?.audio || idx === 0;
-          if (prev.has(groupIndex) && firstReady) {
-            setTimeout(() => startOrderedPlaybackForGroup(groupIndex), 0);
-            const cp = new Set(prev); cp.delete(groupIndex); return cp;
-          }
-          return prev;
+    // Queue the TTS fetch into the small pool (NEW)
+    scheduleTTSJob(async () => {
+      try {
+        const response = await fetch("/api/tts", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            text: ttsText,                   // cleaned!
+            textPosition: sourceFunction,
+            voice: lang === "en" ? "Stefanie" : "Florian",
+            ttsKey: settings.ttsKey,
+            ttsUrl: settings.ttsUrl,
+            ttsModel: settings.ttsModel,
+            universalApiKey: settings.universalApiKey,
+          }),
         });
-      } else if (sourceFunction === "handleOnSpeakAtGroupIndexAction") {
-        handleOnSpeakAtGroupIndexAction(groupIndex);
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const audioData = await response.arrayBuffer();
+        const audioBlob = new Blob([audioData], { type: "audio/wav" });
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl) as HTMLAudioElement & { __text?: string };
+        audio.__text = text; // keep original (with stars/emojis) for regen checks
+
+        // ensure group slot
+        if (!audioFileDict[groupIndex]) audioFileDict[groupIndex] = {};
+
+        // compute index for both "streamN" and "manual_streamN"
+        const idx = indexFromSourceFunction(sourceFunction);
+
+        audioFileDict[groupIndex][idx] = {
+          audio: audio,
+          played: false,
+        };
+
+        // dynamic chaining: link to previous if exists, and link this to next (when present later)
+        wireNeighborChaining(groupIndex, idx);
+        audio.onended = () => {
+          const next = audioFileDict[groupIndex]?.[idx + 1]?.audio;
+          if (next) next.play();
+          setAudioFileDict({ ...audioFileDict });
+        };
+
+        setAudioFileDict((prev) => ({
+          ...prev,
+          [groupIndex]: audioFileDict[groupIndex],
+        }));
+
+        // manual first chunk arrived → autostart
+        if (sourceFunction.startsWith("manual_")) {
+          setPendingManualSpeak((prev) => {
+            const group = audioFileDict[groupIndex] || {};
+            const firstReady = !!group[0]?.audio || idx === 0;
+            if (prev.has(groupIndex) && firstReady) {
+              setTimeout(() => startOrderedPlaybackForGroup(groupIndex), 0);
+              const cp = new Set(prev); cp.delete(groupIndex); return cp;
+            }
+            return prev;
+          });
+        } else if (sourceFunction === "handleOnSpeakAtGroupIndexAction") {
+          handleOnSpeakAtGroupIndexAction(groupIndex);
+        }
+      } catch (error) {
+        console.error("Error fetching TTS:", error);
       }
-    } catch (error) {
-      console.error("Error fetching TTS:", error);
-    }
+    });
   };
 
   // General functions
