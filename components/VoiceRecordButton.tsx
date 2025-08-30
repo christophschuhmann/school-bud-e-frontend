@@ -5,20 +5,15 @@ import { IS_BROWSER } from "$fresh/runtime.ts";
  * VoiceRecordButton component.
  *
  * @component
- * @param {Object} props - The component props.
- * @param {Function} props.onFinishRecording - Callback function called when recording is finished. It receives the transcript as a parameter.
- * @param {Function} props.onInterimTranscript - Callback function called when interim transcript is available. It receives the interim transcript as a parameter.
- * @param {number} props.resetTranscript - A number used to trigger a reset of the transcript.
- * @param {string} props.sttUrl - The URL for the speech-to-text service.
- * @param {string} props.sttKey - The API key for the speech-to-text service.
- * @param {string} props.sttModel - The model to use for speech-to-text conversion.
- * @returns {JSX.Element} The VoiceRecordButton component.
+ * @param {Object} props
+ * @param {Function} props.onFinishRecording
+ * @param {Function} props.onInterimTranscript
+ * @param {number} props.resetTranscript
+ * @param {string} props.sttUrl
+ * @param {string} props.sttKey
+ * @param {string} props.sttModel
+ * @param {string} props.universalApiKey
  */
-
-
-
-// PASTE THIS ENTIRE REVISED FUNCTION IN: school-bud-e-frontend/components/VoiceRecordButton.tsx
-
 function VoiceRecordButton({
   onFinishRecording,
   onInterimTranscript,
@@ -26,7 +21,7 @@ function VoiceRecordButton({
   sttUrl,
   sttKey,
   sttModel,
-  universalApiKey, // <-- CHANGED: Added the universalApiKey prop to be received
+  universalApiKey,
 }: {
   onFinishRecording: (transcript: string) => void;
   onInterimTranscript: (transcript: string) => void;
@@ -34,7 +29,7 @@ function VoiceRecordButton({
   sttUrl: string;
   sttKey: string;
   sttModel: string;
-  universalApiKey: string; // <-- CHANGED: Defined the type for the new prop
+  universalApiKey: string;
 }) {
   const [isRecording, setIsRecording] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -105,14 +100,16 @@ function VoiceRecordButton({
     formData.append("audio", audioBlob, "recording.wav");
 
     if (sttKey.startsWith("gsk_")) {
-      sttUrl = sttUrl == "" ? "https://api.groq.com/openai/v1/audio/transcriptions" : sttUrl;
+      sttUrl = sttUrl == ""
+        ? "https://api.groq.com/openai/v1/audio/transcriptions"
+        : sttUrl;
       sttModel = sttModel == "" ? "whisper-large-v3-turbo" : sttModel;
     }
 
     formData.append("sttUrl", sttUrl);
     formData.append("sttKey", sttKey);
     formData.append("sttModel", sttModel);
-    formData.append("universalApiKey", universalApiKey); // <-- CHANGED: Add the universal key to the form data
+    formData.append("universalApiKey", universalApiKey);
 
     try {
       const response = await fetch("/api/stt", {
@@ -134,7 +131,7 @@ function VoiceRecordButton({
   };
 
   function onEnd() {
-    console.log("Speech recognition has stopped. Starting again ...");
+    console.log("Speech recognition has stopped. Starting again .");
     setIsRecording(false);
   }
 
@@ -162,6 +159,7 @@ function VoiceRecordButton({
       disabled={!IS_BROWSER}
       class={`absolute right-3 bottom-[3.7rem] disabled:opacity-50 disabled:cursor-not-allowed rounded-md p-2 bg-gray-100
         ${isRecording ? "animate-pulse bg-red-600" : ""}`}
+      title={isRecording ? "Aufnahme läuft" : "Sprache aufnehmen"}
     >
       <svg
         xmlns="http://www.w3.org/2000/svg"

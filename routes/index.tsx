@@ -16,13 +16,14 @@ export default function Home(req: Request) {
         backgroundPosition: "center",
         backgroundSize: "cover",
         backgroundRepeat: "no-repeat",
-        height: "100vh", // Ensure full screen height
+        minHeight: "100dvh",
       }}
     >
-      <div class="w-4/5 mx-auto flex flex-col items-center justify-center">
+      <div class="w-full max-w-screen-lg px-1 sm:px-2 mx-auto flex flex-col items-center justify-center">
         <Header lang={lang as string} />
         <ChatAgreementOrIsland lang={lang as string} />
       </div>
     </div>
-  );
-}
+  );   // <- return-Klammer schließen
+
+}     // <- und auch die Funktions-Klammer schließen!

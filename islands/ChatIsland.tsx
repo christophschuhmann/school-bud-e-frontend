@@ -1855,7 +1855,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
       {settings.universalApiKey ||
           (settings.apiKey && settings.apiModel && settings.apiUrl)
         ? (
-          <div className="relative mt-4 mb-12">
+          <div class="relative mt-4 mb-12 w-full">
             <textarea
               value={query}
               placeholder={chatIslandContent[lang]["placeholderText"]}
