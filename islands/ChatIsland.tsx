@@ -108,6 +108,9 @@ export default function ChatIsland({ lang }: { lang: string }) {
   // NEW: pending manual speak groups (autostart when first chunk arrives)
   const [pendingManualSpeak, setPendingManualSpeak] = useState<Set<number>>(new Set());
 
+  // Track if browser blocked autoplay at least once (diagnostic)
+  const [audioUnlockRequired, setAudioUnlockRequired] = useState(false);
+
   // ---------- TTS concurrency pool (NEW) ----------
   const TTS_POOL_LIMIT = 6;
   const ttsActiveRef = useRef(0);
@@ -372,8 +375,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
           groupAudios[nextUnplayedIndex].audio,
           Number(groupIndex),
           nextUnplayedIndex,
-          audioFileDict,
-          setAudioFileDict,
         );
       }
 
@@ -411,7 +412,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
     const [nextUnplayed] = Object.entries(groupAudios)
       .sort(([a], [b]) => Number(a) - Number(b))
       .find(([_, item]) => !item.played) || [];
-    return nextUnplayed ? Number(nextUnplayed) : null;
+    return nextUnplayed !== undefined ? Number(nextUnplayed) : null;
   };
 
   const canPlayAudio = (
@@ -427,24 +428,31 @@ export default function ChatIsland({ lang }: { lang: string }) {
       (previousAudio?.played && previousAudio?.audio.paused);
   };
 
-  const playAudio = (
+  // robust: evaluate play() promise; do not override onended here
+  const playAudio = async (
     audio: HTMLAudioElement,
     groupIndex: number,
     audioIndex: number,
-    audioFileDict_: AudioFileDict,
-    setAudioFileDict_: (dict: AudioFileDict) => void,
   ) => {
-    audio.play();
-    audioFileDict_[groupIndex][audioIndex].played = true;
-
-    // Add onended handler to update state when audio finishes
-    audio.onended = () => {
-      audioFileDict_[groupIndex][audioIndex].played = true;
-      setAudioFileDict_({ ...audioFileDict_ }); // Force state update
-    };
-
-    // Force immediate state update when starting playback
-    setAudioFileDict_({ ...audioFileDict_ });
+    try {
+      await audio.play();
+      // mark played only after successful start
+      setAudioFileDict((prev) => {
+        const next = { ...prev };
+        const group = { ...(next[groupIndex] || {}) };
+        const item = { ...(group[audioIndex] || {}) } as AudioItem;
+        item.played = true;
+        group[audioIndex] = item;
+        next[groupIndex] = group;
+        return next;
+      });
+    } catch (err: any) {
+      console.warn("Audio play() rejected:", err?.name || err);
+      if (err?.name === "NotAllowedError") {
+        setAudioUnlockRequired(true);
+      }
+      // do NOT mark as played; allow retry on user gesture
+    }
   };
 
   // ---------- Smart Chunking ----------
@@ -505,7 +513,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
     return parts;
   };
 
-  // ordered playback starter (used when first manual chunk arrives)
+  // ordered playback starter: start first unplayed; chaining happens via neighbor wiring
   const startOrderedPlaybackForGroup = (groupIndex: number) => {
     // Pause all other groups and mark them as stopped to avoid overlaps
     const newStopList = stopList.slice();
@@ -523,43 +531,56 @@ export default function ChatIsland({ lang }: { lang: string }) {
     });
     setStopList(newStopList);
 
-    // Play first and attach chaining
-    const first = audioFileDict[groupIndex]?.[0]?.audio;
+    const group = audioFileDict[groupIndex];
+    if (!group) return;
+    const nextIdx = findNextUnplayedAudio(group);
+    const first = nextIdx !== null ? group[nextIdx]?.audio : group[0]?.audio;
     if (!first) return;
 
-    const chain = (idx: number) => {
-      const curr = audioFileDict[groupIndex]?.[idx]?.audio;
-      if (!curr) return;
-      curr.onended = () => {
-        const nextIdx = idx + 1;
-        const next = audioFileDict[groupIndex]?.[nextIdx]?.audio;
-        if (next) next.play();
-        setAudioFileDict({ ...audioFileDict });
-      };
-    };
-
-    Object.keys(audioFileDict[groupIndex] || {}).map(Number).sort((a,b)=>a-b).forEach(chain);
-
-    first.play();
-    setAudioFileDict({ ...audioFileDict });
+    // do not override onended here; neighbor wiring will manage sequencing
+    first.play().catch((err) => {
+      console.warn("Audio play() rejected on start:", err?.name || err);
+      if (err?.name === "NotAllowedError") setAudioUnlockRequired(true);
+    });
   };
 
-  // connect manual chunks to their neighbors as they arrive (so late arrivals still chain)
+  // connect manual/stream chunks to their neighbors as they arrive (so late arrivals still chain)
   const wireNeighborChaining = (groupIndex: number, idx: number) => {
     const prev = audioFileDict[groupIndex]?.[idx - 1]?.audio;
+    const curr = audioFileDict[groupIndex]?.[idx]?.audio;
+    if (!curr) return;
+
     if (prev) {
       prev.onended = () => {
         const next = audioFileDict[groupIndex]?.[idx]?.audio;
-        if (next) next.play();
-        setAudioFileDict({ ...audioFileDict });
+        if (next) {
+          next.play().catch((err) => {
+            console.warn("Audio play() rejected in chain:", err?.name || err);
+            if (err?.name === "NotAllowedError") setAudioUnlockRequired(true);
+          });
+        }
+        setAudioFileDict((p) => ({ ...p }));
       };
-      // if previous already ended → start now
+
+      // if previous already ended (played & paused), start now
       const prevItem = audioFileDict[groupIndex][idx - 1];
-      if (prevItem.played && prevItem.audio.paused && !stopList.includes(groupIndex)) {
-        const curr = audioFileDict[groupIndex]?.[idx]?.audio;
-        curr?.play();
+      if (prevItem?.played && prevItem.audio.paused && !stopList.includes(groupIndex)) {
+        curr.play().catch((err) => {
+          console.warn("Audio play() rejected (prev-ended fast-path):", err?.name || err);
+          if (err?.name === "NotAllowedError") setAudioUnlockRequired(true);
+        });
       }
     }
+
+    // Release object URL when this audio finishes (memory hygiene)
+    const src = curr.src;
+    curr.onended = (() => {
+      const old = curr.onended;
+      return () => {
+        try { if (src?.startsWith("blob:")) URL.revokeObjectURL(src); } catch {}
+        if (old) old.call(curr);
+      };
+    })();
   };
 
   // ---------- Trigger helpers (robust parsing) ----------
@@ -1284,10 +1305,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
         setQuery("");
 
         // Flush any safe carry left in the think-filter (NEW)
-        const tailVisible = (() => {
-          try { return makeThinkFilter().flush(); } catch { return ""; }
-        })(); // dummy; but we need the real instance:
-        // Correct usage: call flush on the actual filter instance
         const flushed = filterThink.flush();
         if (flushed) {
           appendToAssistant(flushed);
@@ -1387,7 +1404,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
     });
   };
 
-  // 2. getTTS  (MODIFIED: supports manual_streamN + robust chaining + CLEANING + POOL)
+  // 2. getTTS  (MODIFIED: honors Content-Type; robust chaining; CLEANING; POOL; play() handling)
   const getTTS = async (
     text: string,
     groupIndex: number,
@@ -1408,28 +1425,31 @@ export default function ChatIsland({ lang }: { lang: string }) {
 
       const sourceFunctionIndex = indexFromSourceFunction(sourceFunction);
 
-      if (!audioFileDict[groupIndex]) audioFileDict[groupIndex] = {};
-      audioFileDict[groupIndex][sourceFunctionIndex] = {
-        audio: audio,
-        played: false,
-      };
+      setAudioFileDict((prev) => {
+        const next = { ...prev };
+        const group = { ...(next[groupIndex] || {}) };
+        group[sourceFunctionIndex] = { audio, played: false };
+        next[groupIndex] = group;
+        return next;
+      });
 
       // pause all other groups
-      const newStopList = stopList.slice();
-      for (let i = 0; i < groupIndex; i++) {
-        if (audioFileDict[i]) {
-          (Object.values(audioFileDict[i]) as AudioItem[]).forEach((item) => {
-            if (!item.audio.paused) {
-              item.audio.pause();
-              item.audio.currentTime = 0;
-              if (!newStopList.includes(i)) newStopList.push(i);
-            }
-          });
+      setStopList((prev) => {
+        const newStopList = prev.slice();
+        for (let i = 0; i < groupIndex; i++) {
+          const g = audioFileDict[i];
+          if (g) {
+            Object.values(g).forEach((item) => {
+              if (!item.audio.paused) {
+                item.audio.pause();
+                item.audio.currentTime = 0;
+                if (!newStopList.includes(i)) newStopList.push(i);
+              }
+            });
+          }
         }
-      }
-
-      setStopList(newStopList);
-      setAudioFileDict({ ...audioFileDict });
+        return newStopList;
+      });
 
       if (sourceFunction.startsWith("manual_")) {
         // manual path: start chain when first arrives
@@ -1469,35 +1489,37 @@ export default function ChatIsland({ lang }: { lang: string }) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
 
+        const contentType = response.headers.get("Content-Type") || "audio/mpeg";
         const audioData = await response.arrayBuffer();
-        const audioBlob = new Blob([audioData], { type: "audio/wav" });
+        const audioBlob = new Blob([audioData], { type: contentType });
         const audioUrl = URL.createObjectURL(audioBlob);
         const audio = new Audio(audioUrl) as HTMLAudioElement & { __text?: string };
         audio.__text = text; // keep original (with stars/emojis) for regen checks
 
         // ensure group slot
-        if (!audioFileDict[groupIndex]) audioFileDict[groupIndex] = {};
-
-        // compute index for both "streamN" and "manual_streamN"
         const idx = indexFromSourceFunction(sourceFunction);
+        setAudioFileDict((prev) => {
+          const next = { ...prev };
+          const group = { ...(next[groupIndex] || {}) };
+          group[idx] = { audio, played: false };
+          next[groupIndex] = group;
+          return next;
+        });
 
-        audioFileDict[groupIndex][idx] = {
-          audio: audio,
-          played: false,
-        };
-
-        // dynamic chaining: link to previous if exists, and link this to next (when present later)
+        // dynamic chaining: link to previous and add cleanup on ended
         wireNeighborChaining(groupIndex, idx);
-        audio.onended = () => {
-          const next = audioFileDict[groupIndex]?.[idx + 1]?.audio;
-          if (next) next.play();
-          setAudioFileDict({ ...audioFileDict });
-        };
-
-        setAudioFileDict((prev) => ({
-          ...prev,
-          [groupIndex]: audioFileDict[groupIndex],
-        }));
+        audio.addEventListener("ended", () => {
+          // mark this item as played (idempotent)
+          setAudioFileDict((prev) => {
+            const next = { ...prev };
+            const group = { ...(next[groupIndex] || {}) };
+            const item = { ...(group[idx] || {}) } as AudioItem;
+            item.played = true;
+            group[idx] = item;
+            next[groupIndex] = group;
+            return next;
+          });
+        });
 
         // manual first chunk arrived → autostart
         if (sourceFunction.startsWith("manual_")) {
@@ -1702,6 +1724,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
         <button
           class="rounded-full bg-slate-200 px-4 py-2 mx-2 mb-2"
           onClick={() => setShowSettings(true)}
+          title={audioUnlockRequired ? "Hinweis: Browser blockierte Autoplay, bitte per Klick starten." : ""}
         >
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -1813,7 +1836,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
             width="24px"
             fill="#000000"
           >
-            <path d="M440-200h80v-167l64 64 56-57-160-160-160 160 57 56 63-63v167ZM240-80q-33 0-56.5-23.5T160-160v-640q0-33 23.5-56.5T240-880h320l240 240v480q0 33-23.5 56.5T720-80H240Zm280-520v-200H240v640h480v-440H520ZM240-800v200-200 640-640Z" />
+            <path d="M440-200h80v-167l64 64 56-57-160-160-160 160 57 56 63-63v167ZM240-80q-33 0-56.5-23.5T160-160v-640q0-33 23.5-56.5T240-880h320l240 240v480q0 33-23.5 56.5-56.5 23.5-720 23.5H240Zm280-520v-200H240v640h480v-440H520ZM240-800v200-200 640-640Z" />
           </svg>
         </button>
       </div>

@@ -5,37 +5,37 @@ const TTS_KEY = Deno.env.get("TTS_KEY") || "";
 const TTS_URL = Deno.env.get("TTS_URL") || "";
 const TTS_MODEL = Deno.env.get("TTS_MODEL") || "";
 
+/**
+ * MARS6 helper
+ */
 async function callMARS6API(
   text: string,
   ttsUrl: string,
   ttsKey: string,
 ) {
   async function createTTSTask(
-    ttsUrl: string,
-    ttsKey: string,
+    url: string,
+    key: string,
     voiceID: number = 20299,
     language: number = 1,
   ) {
     try {
-      const response = await fetch(
-        `${ttsUrl}/tts`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": ttsKey,
-          },
-          body: JSON.stringify({
-            text: text,
-            voice_id: voiceID,
-            language: language,
-          }),
+      const response = await fetch(`${url}/tts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": key,
         },
-      );
+        body: JSON.stringify({
+          text,
+          voice_id: voiceID,
+          language,
+        }),
+      });
       const responseJSON = await response.json();
       console.log(`Status code for creating TTS: ${response.status}`);
       if (response.ok) {
-        return responseJSON.task_id;
+        return responseJSON.task_id as string;
       } else {
         console.error(
           `Failed to create TTS task for MARS6. Status code: ${response.status}: ${response.statusText}`,
@@ -46,15 +46,14 @@ async function callMARS6API(
     }
   }
 
-  async function pollTTSTask(ttsUrl: string, ttsKey: string, taskID: string) {
-    const delay = (ms: number) =>
-      new Promise((resolve) => setTimeout(resolve, ms));
+  async function pollTTSTask(url: string, key: string, taskID: string): Promise<number> {
+    const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
     try {
-      const response = await fetch(`${ttsUrl}/tts/${taskID}`, {
+      const response = await fetch(`${url}/tts/${taskID}`, {
         method: "GET",
         headers: {
           "Content-Type": "application/json",
-          "x-api-key": ttsKey,
+          "x-api-key": key,
         },
       });
 
@@ -63,10 +62,10 @@ async function callMARS6API(
       console.log(`Polling: ${status}`);
 
       if (status === "SUCCESS") {
-        return responseJSON.run_id;
+        return responseJSON.run_id as number;
       }
-      await delay(1500); // Wait for 1.5 seconds before the next poll.
-      return pollTTSTask(ttsUrl, ttsKey, taskID); // Recursive call for polling.
+      await delay(1500);
+      return pollTTSTask(url, key, taskID);
     } catch (error) {
       console.error("Error polling TTS task:", error);
       throw error;
@@ -74,20 +73,17 @@ async function callMARS6API(
   }
 
   async function getTTSAudioResult(
-    ttsUrl: string,
-    ttsKey: string,
+    url: string,
+    key: string,
     runID: number,
   ) {
     try {
-      const response = await fetch(
-        `${ttsUrl}/tts-result/${runID}`,
-        {
-          method: "GET",
-          headers: {
-            "x-api-key": ttsKey,
-          },
+      const response = await fetch(`${url}/tts-result/${runID}`, {
+        method: "GET",
+        headers: {
+          "x-api-key": key,
         },
-      );
+      });
       if (response.ok) {
         return await response.arrayBuffer();
       } else {
@@ -101,10 +97,8 @@ async function callMARS6API(
   }
 
   try {
-    const taskID: string = await createTTSTask(
-      ttsUrl,
-      ttsKey,
-    );
+    const taskID = await createTTSTask(ttsUrl, ttsKey);
+    if (!taskID) throw new Error("No task_id from MARS6");
     const runID = await pollTTSTask(ttsUrl, ttsKey, taskID);
     return await getTTSAudioResult(ttsUrl, ttsKey, runID);
   } catch (error) {
@@ -113,8 +107,10 @@ async function callMARS6API(
   }
 }
 
-// REPLACE YOUR EXISTING textToSpeech FUNCTION WITH THIS ENTIRE BLOCK
-
+/**
+ * Text-to-Speech dispatcher
+ * Returns binary audio as Buffer (we respond with audio/mpeg).
+ */
 async function textToSpeech(
   text: string,
   textPosition: string,
@@ -122,82 +118,67 @@ async function textToSpeech(
   ttsKey: string,
   ttsModel: string,
 ): Promise<Buffer | null> {
+  // clean markup
   const boldTextRegex = /\*\*(.*?)\*\*/g;
   text = String(text).replace(boldTextRegex, "$1");
-
-  const buddyRegex = /bud-e/gi;
-  text = text.replace(buddyRegex, "buddy");
+  text = text.replace(/bud-e/gi, "buddy");
 
   console.log("textToSpeech", text);
   console.log("textPosition", textPosition);
-  console.log("ttsUrl", ttsUrl);
-  console.log("ttsKey", ttsKey);
-  console.log("ttsModel", ttsModel);
+  console.log("ttsUrl", ttsUrl || TTS_URL);
+  console.log("ttsKey", ttsKey ? "[provided]" : "[env/default]");
+  console.log("ttsModel", ttsModel || TTS_MODEL);
 
-  const useThisTttsUrl = ttsUrl != "" ? ttsUrl : TTS_URL;
-  const useThisTtsKey = ttsKey != "" ? ttsKey : TTS_KEY;
-  const useThisTtsModel = ttsModel != "" ? ttsModel : TTS_MODEL;
+  const useThisTtsUrl = ttsUrl !== "" ? ttsUrl : TTS_URL;
+  const useThisTtsKey = ttsKey !== "" ? ttsKey : TTS_KEY;
+  const useThisTtsModel = ttsModel !== "" ? ttsModel : TTS_MODEL;
 
   try {
-    // --- START OF REVISED LOGIC ---
+    // Fish Audio heuristic (32-hex ID → uses "reference_id" & returns MP3)
+    if (useThisTtsModel && /^[a-fA-F0-9]{32}$/.test(useThisTtsModel)) {
+      const startTime = Date.now();
+      const response = await fetch(useThisTtsUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${useThisTtsKey}`,
+        },
+        body: JSON.stringify({
+          text,
+          normalize: true,
+          format: "mp3",
+          reference_id: useThisTtsModel,
+          mp3_bitrate: 64,
+          opus_bitrate: -1000,
+          latency: "normal",
+        }),
+      });
 
-    // Fish Audio models are 32-character hexadecimal IDs. We can detect them by their length.
-    if (useThisTtsModel && useThisTtsModel.length === 32) {
-        const startTime = Date.now();
-        const response = await fetch(useThisTttsUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${useThisTtsKey}`,
-          },
-          // This is the specific payload format that Fish Audio expects.
-          body: JSON.stringify({
-            text: text,
-            normalize: true,
-            format: "mp3",
-            reference_id: useThisTtsModel, // Fish uses reference_id for the model
-            mp3_bitrate: 64,
-            opus_bitrate: -1000,
-            latency: "normal",
-          }),
-        });
-
-        if (response.ok) {
-          const audioData = await response.arrayBuffer();
-          console.log(
-            `Audio file received for ${textPosition}, Latency:`,
-            Date.now() - startTime,
-          );
-          return Buffer.from(audioData);
-        } else {
-          console.error(
-            `Failed to synthesize speech. Status code: ${response.status}: ${response.statusText}`,
-          );
-          return null; // Explicitly return null on failure
-        }
+      if (response.ok) {
+        const audioData = await response.arrayBuffer();
+        console.log(`Audio file received for ${textPosition}, Latency:`, Date.now() - startTime);
+        return Buffer.from(audioData);
+      } else {
+        console.error(
+          `Fish TTS failed. Status code: ${response.status}: ${response.statusText}`,
+        );
+        return null;
+      }
     }
 
-    // This logic handles other providers like Deepgram, which have specific model names.
+    // Provider switch (simple normalization)
     switch (useThisTtsModel) {
       case "MARS6": {
-        // ... (This block is unchanged)
-        const audioData = await callMARS6API(text, ttsUrl, ttsKey);
-        if (audioData) { return Buffer.from(audioData); }
-        else { console.error(`Failed to synthesize speech.`); break; }
-      }
-      case "aura-helios-en": {
-        // ... (This block is unchanged)
-        const startTime = Date.now();
-        const response = await fetch(useThisTttsUrl, { /* ... */ });
-        if (response.ok) { return Buffer.from(await response.arrayBuffer()); }
-        else { console.error(`...`); }
+        const audioData = await callMARS6API(text, useThisTtsUrl, useThisTtsKey);
+        if (audioData) return Buffer.from(audioData);
+        console.error(`MARS6 synthesis failed.`);
         break;
       }
-      // This default case now correctly handles your middleware and any other
-      // standard OpenAI-compatible TTS provider.
-      default: {
+
+      case "aura-helios-en": {
+        // Fallback: treat like OpenAI-compatible / simple JSON API returning binary audio
         const startTime = Date.now();
-        const response = await fetch(useThisTttsUrl, {
+        const response = await fetch(useThisTtsUrl, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -206,6 +187,33 @@ async function textToSpeech(
           body: JSON.stringify({
             model: useThisTtsModel,
             input: text,
+            // voice can be optional here depending on backend; add if required.
+          }),
+        });
+        if (response.ok) {
+          const audioData = await response.arrayBuffer();
+          console.log(`Audio [aura-helios-en] received for ${textPosition}, Latency:`, Date.now() - startTime);
+          return Buffer.from(audioData);
+        } else {
+          console.error(`aura-helios-en failed. Status code: ${response.status} ${response.statusText}`);
+        }
+        break;
+      }
+
+      default: {
+        // Default: OpenAI-compatible audio/speech endpoint: returns binary audio (mp3)
+        const startTime = Date.now();
+        const response = await fetch(useThisTtsUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${useThisTtsKey}`,
+          },
+          body: JSON.stringify({
+            model: useThisTtsModel,
+            input: text,
+            // If your middleware requires "voice" or "format", add here.
+            // format: "mp3",
           }),
         });
 
@@ -223,8 +231,6 @@ async function textToSpeech(
         }
       }
     }
-    // --- END OF REVISED LOGIC ---
-
   } catch (error) {
     console.error(`Error in textToSpeech: ${error}`);
   }
@@ -233,28 +239,24 @@ async function textToSpeech(
 
 export const handler: Handlers = {
   async POST(req) {
-    // --- Start of new logic ---
     const payload = await req.json();
     const { text, textPosition, ttsUrl, ttsKey, ttsModel, universalApiKey } = payload;
 
     const MIDDLEWARE_BASE_URL = "http://65.109.157.234:8787";
 
-    // These variables will hold the final values to be used.
+    // Final URL/Key (universal key overrides)
     let useThisTtsUrl = ttsUrl;
     let useThisTtsKey = ttsKey;
 
-    // If a universalApiKey is provided, it overrides the specific TTS settings.
     if (universalApiKey) {
-        useThisTtsUrl = `${MIDDLEWARE_BASE_URL}/v1/audio/speech`;
-        useThisTtsKey = universalApiKey;
+      useThisTtsUrl = `${MIDDLEWARE_BASE_URL}/v1/audio/speech`;
+      useThisTtsKey = universalApiKey;
     }
-    // --- End of new logic ---
 
     if (!text) {
       return new Response("No text provided", { status: 400 });
     }
 
-    // The textToSpeech function now receives the potentially overridden URL and key.
     const audioData = await textToSpeech(
       text,
       textPosition,
@@ -264,10 +266,12 @@ export const handler: Handlers = {
     );
 
     if (audioData) {
+      // Use audio/mpeg consistently (front-end reads header & sets Blob type accordingly)
       const response = new Response(audioData, {
         status: 200,
         headers: {
-          "Content-Type": "audio/mp3",
+          "Content-Type": "audio/mpeg",
+          "Cache-Control": "no-store",
         },
       });
       return response;
