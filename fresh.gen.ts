@@ -7,6 +7,7 @@ import * as $_app from "./routes/_app.tsx";
 import * as $about from "./routes/about.tsx";
 import * as $api_bildungsplan from "./routes/api/bildungsplan.ts";
 import * as $api_chat from "./routes/api/chat.ts";
+import * as $api_debug from "./routes/api/debug.ts";
 import * as $api_papers from "./routes/api/papers.ts";
 import * as $api_stt from "./routes/api/stt.ts";
 import * as $api_tts from "./routes/api/tts.ts";
@@ -26,6 +27,7 @@ const manifest = {
     "./routes/about.tsx": $about,
     "./routes/api/bildungsplan.ts": $api_bildungsplan,
     "./routes/api/chat.ts": $api_chat,
+    "./routes/api/debug.ts": $api_debug,
     "./routes/api/papers.ts": $api_papers,
     "./routes/api/stt.ts": $api_stt,
     "./routes/api/tts.ts": $api_tts,

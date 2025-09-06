@@ -81,6 +81,26 @@ export default function ChatIsland({ lang }: { lang: string }) {
   const [currentChatSuffix, setCurrentChatSuffix] = useState("0");
   const [localStorageKeys, setLocalStorageKeys] = useState([] as string[]);
 
+  // ---------- DEBUG helper (sendet Logs an den Server) ----------
+  const DEBUG = true;
+  const serverLog = async (stage: string, detail?: unknown) => {
+    if (!DEBUG) return;
+    try {
+      await fetch("/api/debug", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stage,
+          chat: currentChatSuffix,
+          detail,
+        }),
+      });
+    } catch {
+      // debug darf niemals den Flow stören
+    }
+  };
+  // -------------------------------------------------------------
+
   // dictionary containing audio files for each groupIndex for the current chat
   const [audioFileDict, setAudioFileDict] = useState<AudioFileDict>({});
 
@@ -576,13 +596,15 @@ export default function ChatIsland({ lang }: { lang: string }) {
       if (q) triggers.push({ kind: "bildungsplan", q, n, autoSummarize: false });
     }
 
+    // DEBUG
+    serverLog("hashtag.detect.done", { raw, triggers });
+
     return triggers;
   };
+
   // ---------- NEW: JSON-based trigger extraction (user & assistant) ----------
 
-  // Ersetzt: extractTopLevelJsonBlocks
   // Findet nur TOP-LEVEL JSON-Objekte, deren Klammern *balanciert* sind.
-  // Unvollständige Blöcke (ohne schließende }) werden NICHT zurückgegeben.
   const extractCompletedJsonSearchBlocks = (s: string): string[] => {
     const blocks: string[] = [];
     let depth = 0, start = -1;
@@ -606,9 +628,10 @@ export default function ChatIsland({ lang }: { lang: string }) {
         if (depth > 0) depth--;
         if (depth === 0 && start !== -1) {
           const block = s.slice(start, i + 1);
-          // Sanity: muss mit { beginnen und mit } enden
           if (/^\s*{\s*./.test(block) && /}\s*$/.test(block)) {
             blocks.push(block);
+            // DEBUG für jedes abgeschlossene Objekt
+            serverLog("json.block.closed", { block });
           }
           start = -1;
         }
@@ -617,7 +640,6 @@ export default function ChatIsland({ lang }: { lang: string }) {
     return blocks;
   };
 
-  // Neu: strenges Validieren des inhaltlichen Schemas (genau 1 erlaubter Key)
   const isValidSearchJson = (obj: any): boolean => {
     if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
     const allowed = new Set(["wikipedia", "wikipedia_de", "wikipedia_en", "papers", "bildungsplan"]);
@@ -641,20 +663,17 @@ export default function ChatIsland({ lang }: { lang: string }) {
     return false;
   };
 
-  // Ersetzt: findJsonTriggersInText
-  // Achtung: Triggert NUR bei *vollständig geschlossenen* JSON-Objekten.
-  // Keine Auslösung während Streaming, solange die } noch nicht da ist.
+  // JSON-Trigger Finder
   const findJsonTriggersInText = (raw: string): AutoTrigger[] => {
+    // DEBUG: Start
+    serverLog("json.detect.start", { sampleTail: raw.slice(-250) });
+
     const blocks = extractCompletedJsonSearchBlocks(raw);
     const all: AutoTrigger[] = [];
 
     for (const b of blocks) {
       let obj: any = null;
-
-      // 1) strenges JSON
       try { obj = JSON.parse(b); } catch { obj = null; }
-
-      // 2) minimal „lenient“, aber nur wenn Klammern bereits vollständig sind
       if (!obj) {
         const normalized = b
           .replace(/([{,\s])'([^']+?)'\s*:/g, '$1"$2":')
@@ -662,15 +681,17 @@ export default function ChatIsland({ lang }: { lang: string }) {
           .replace(/,(\s*[}\]])/g, "$1");
         try { obj = JSON.parse(normalized); } catch { obj = null; }
       }
-
       if (!obj || !isValidSearchJson(obj)) continue;
       all.push(...jsonObjToTriggers(obj));
     }
 
+    // DEBUG: Done
+    serverLog("json.detect.done", { triggers: all });
+
     return all;
   };
 
-  // Lenient JSON parse: try strict first, then mild cleanup (single quotes -> double, trailing commas)
+  // Lenient JSON parse (unused externally but kept)
   const tryParseJsonLenient = (raw: string): any | null => {
     try { return JSON.parse(raw); } catch {}
     let s = raw.trim();
@@ -724,21 +745,43 @@ export default function ChatIsland({ lang }: { lang: string }) {
     return triggers;
   };
 
-  // Build a summarization prompt (DE/EN) for the auto-follow-up stream
+  // Build a summarization prompt (with i18n + safe encoding + local overrides)
   const buildAutoSummaryPrompt = (trigs: AutoTrigger[]) => {
     const topics = trigs.map(t => `${t.kind}: "${t.q}"`).join(", ");
-    if (lang === "de") {
-      return `Bitte fasse die oben angezeigten Suchergebnisse (${topics}) prägnant zusammen:
-- Nenne die Kernaussagen in klaren Stichpunkten.
-- Hebe ggf. Relevanz für Unterricht/Kontext hervor.
-- Füge am Ende 3–5 kurze Bulletpoints mit Quellen/URLs aus den gezeigten Ergebnissen an.
-Nutze nur die sichtbaren Ergebnisse als Grundlage.`;
+
+    // 1) Optional per-language localStorage override (no UI needed):
+    //    Put "{topics}" where you want the joined topics.
+    //    Example (in DevTools console):
+    //    localStorage.setItem('bud-e-summary-template-de', 'Bitte fasse ({topics}) ...');
+    //    localStorage.setItem('bud-e-summary-template-en', 'Please summarize ({topics}) ...');
+    const overrideKey =
+      lang === "de" ? "bud-e-summary-template-de" : "bud-e-summary-template-en";
+    const override = (typeof localStorage !== "undefined")
+      ? localStorage.getItem(overrideKey)
+      : null;
+    if (override && override.includes("{topics}")) {
+      return override.replaceAll("{topics}", topics);
     }
-    return `Please summarize the search results shown above (${topics}) concisely:
-- Provide key takeaways in bullets.
-- Highlight relevance to the user's context if applicable.
-- Add 3–5 short bullets with sources/URLs from the shown results.
-Use only the visible results as your basis.`;
+
+    // 2) Defaults (ASCII-safe via \u escapes to avoid mojibake on non-UTF-8 builds)
+    if (lang === "de") {
+      return (
+  `Bitte fasse die oben angezeigten Suchergebnisse (${topics}) pr\u00E4gnant zusammen:
+  - Nenne die Kernaussagen in klaren Stichpunkten.
+  - Hebe ggf. Relevanz f\u00FCr Unterricht/Kontext hervor.
+  - F\u00FCge am Ende 3\u20135 kurze Bulletpoints mit Quellen/URLs aus den gezeigten Ergebnissen an.
+  Nutze nur die sichtbaren Ergebnisse als Grundlage.`
+      );
+    }
+
+    // English default
+    return (
+  `Please summarize the search results shown above (${topics}) concisely:
+  - Provide key takeaways in clear bullet points.
+  - Highlight relevance to the user's context if applicable.
+  - Add 3\u20135 short bullets with sources/URLs from the shown results.
+  Use only the visible results as your basis.`
+    );
   };
 
   // ---------- Chat list actions ----------
@@ -750,8 +793,7 @@ Use only the visible results as your basis.`;
     abortRef.current = null;
     setIsStreamComplete(true);
 
-    // We want to re-run from this assistant turn’s *preceding user* turn (if present),
-    // keeping everything before that user turn.
+    // We want to re-run from this assistant turn’s *preceding user* turn (if present)
     let sliceStart = groupIndex;
     if (messages[groupIndex - 1]?.role === "user") {
       sliceStart = groupIndex - 1;
@@ -787,7 +829,6 @@ Use only the visible results as your basis.`;
       if (typeof message.content[0] === "string") {
         contentToEdit = message.content.join("");
       } else {
-        // Handle content array of objects with text and image_url
         contentToEdit = message.content
           // deno-lint-ignore no-explicit-any
           .filter((item: any) => item.type === "text")
@@ -851,12 +892,10 @@ Use only the visible results as your basis.`;
     if (!text) return;
 
     if (!audioFileDict[groupIndex]) {
-      // first time → generate chunks and parallel TTS
       speakMessageInSmartChunks(groupIndex, text);
       return;
     }
 
-    // If we already have audio but text changed, regenerate via chunks
     const firstItem = audioFileDict[groupIndex][0];
     const prevText = firstItem?.audio?.__text ?? "";
     if (text !== String(prevText).trim()) {
@@ -864,7 +903,6 @@ Use only the visible results as your basis.`;
       return;
     }
 
-    // Otherwise play/pause as before
     const indexThatIsPlaying = Object.entries(audioFileDict[groupIndex])
       .findIndex(([_, item]) => !item.audio.paused);
 
@@ -920,11 +958,9 @@ Use only the visible results as your basis.`;
   };
 
   // ======= TTS CLEANING =======
-  // Remove asterisks and emoji characters (keep words intact)
   const cleanForTTS = (s: string) =>
     s
       .replace(/\*/g, "")
-      // Remove common emoji ranges + variation selectors + ZWJ
       .replace(
         /[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FAFF}\u2600-\u26FF\u2700-\u27BF\uFE0F\u200D]/gu,
         ""
@@ -993,7 +1029,7 @@ Use only the visible results as your basis.`;
         state.carry = "";
         return tail;
       }
-      state.carry = ""; // discard if still inside <think>
+      state.carry = "";
       return "";
     };
 
@@ -1003,93 +1039,126 @@ Use only the visible results as your basis.`;
   // ---- API helpers ----
   const fetchBildungsplan = async (query_: string, top_n: number) => {
     try {
+      // DEBUG req
+      await serverLog("api.fetch.bildungsplan.req", { query: query_, top_n });
+
       const response = await fetch("/api/bildungsplan", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: query_,
-          top_n: top_n,
+          top_n,
+          universalApiKey: settings.universalApiKey,
         }),
       });
 
+      await serverLog("api.fetch.bildungsplan.rsp", {
+        ok: response.ok,
+        status: response.status,
+      });
+
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        console.error("bildungsplan API HTTP", response.status, await response.text().catch(() => ""));
+        return { results: [] as { text: string; score: number }[] };
       }
 
-      const data = await response.json() as BildungsplanResponse;
+      const data = (await response.json()) as BildungsplanResponse | null;
 
-      return data;
+      await serverLog("api.fetch.bildungsplan.parsed", {
+        count: data?.results?.length ?? 0,
+      });
+
+      return data ?? { results: [] };
     } catch (error) {
       console.error("Error in bildungsplan API:", error);
+      await serverLog("api.fetch.bildungsplan.error", { error: String(error) });
+      return { results: [] };
     }
   };
 
-  const fetchWikipedia = async (
-    text: string,
-    collection: string,
-    n: number,
-  ) => {
+  const fetchWikipedia = async (text: string, collection: string, n: number) => {
     try {
+      // DEBUG req
+      await serverLog("api.fetch.wikipedia.req", { text, collection, n });
+
       const response = await fetch("/api/wikipedia", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          text: text,
-          collection: collection,
-          n: n,
+          text,
+          collection,
+          n,
+          universalApiKey: settings.universalApiKey,
         }),
       });
 
+      await serverLog("api.fetch.wikipedia.rsp", {
+        ok: response.ok,
+        status: response.status,
+      });
+
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        console.error("wikipedia API HTTP", response.status, await response.text().catch(() => ""));
+        return [] as WikipediaResult[];
       }
 
-      const data = await response.json() as WikipediaResult[];
+      const data = (await response.json()) as WikipediaResult[] | null;
 
-      return data;
+      await serverLog("api.fetch.wikipedia.parsed", { count: data?.length ?? 0 });
+
+      return data ?? [];
     } catch (error) {
       console.error("Error in wikipedia API:", error);
+      await serverLog("api.fetch.wikipedia.error", { error: String(error) });
+      return [] as WikipediaResult[];
     }
   };
 
   const fetchPapers = async (query_: string, limit: number) => {
     try {
+      // DEBUG req
+      await serverLog("api.fetch.papers.req", { query: query_, limit });
+
       const response = await fetch("/api/papers", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: query_,
-          limit: limit,
+          limit,
+          universalApiKey: settings.universalApiKey,
         }),
       });
 
+      await serverLog("api.fetch.papers.rsp", {
+        ok: response.ok,
+        status: response.status,
+      });
+
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        console.error("papers API HTTP", response.status, await response.text().catch(() => ""));
+        return { payload: { items: [] as PapersItem[] } } as PapersResponse;
       }
 
-      const data = await response.json() as PapersResponse;
+      const data = (await response.json()) as PapersResponse | null;
 
-      return data;
+      await serverLog("api.fetch.papers.parsed", {
+        count: data?.payload?.items?.length ?? 0,
+      });
+
+      return data ?? { payload: { items: [] } };
     } catch (error) {
       console.error("Error in papers API:", error);
+      await serverLog("api.fetch.papers.error", { error: String(error) });
+      return { payload: { items: [] } } as PapersResponse;
     }
   };
 
   // ---------- PRIMARY: startStream ----------
   const startStream = async (transcript: string, prevMessages?: Message[]) => {
-    // If we're editing a previous user message (and not the last one), just update and exit
+    // If we're editing a previous user message
     if (currentEditIndex !== undefined && currentEditIndex !== -1) {
       const updated = [...messages];
-      updated[currentEditIndex] = {
-        ...updated[currentEditIndex],
-        content: query,
-      };
+      updated[currentEditIndex] = { ...updated[currentEditIndex], content: query };
       setMessages(updated);
       safePersist(updated, currentChatSuffix);
       setQuery("");
@@ -1110,18 +1179,17 @@ Use only the visible results as your basis.`;
 
     if (!isStreamComplete) return;
 
-    // Cancel any previous fetchEventSource if it exists
+    // Cancel previous stream
     abortRef.current?.abort();
     abortRef.current = new AbortController();
 
     setIsStreamComplete(false);
     setResetTranscript((n) => n + 1);
 
-    // Build the outbound user "content" payload (text + images + PDFs)
+    // Build outbound user content
     const userText = transcript && transcript.trim() !== "" ? transcript : query;
     let previousMessages = prevMessages || messages;
 
-    // Normalize any array-based assistant texts into plain strings for safety
     previousMessages = previousMessages.map((m) => {
       if (typeof m.content === "string") return m;
       if (Array.isArray(m.content) && typeof m.content[0] === "string") {
@@ -1139,7 +1207,7 @@ Use only the visible results as your basis.`;
       { role: "user", content: contentPayload },
     ];
 
-    // Clear composer state immediately for snappy UX
+    // Clear composer state
     setImages([]);
     setPdfs([]);
     setMessages(newMessagesArr);
@@ -1147,14 +1215,27 @@ Use only the visible results as your basis.`;
     setQuery("");
     resetComposerHeight();
 
+    // DEBUG: Beginn des Flows
+    serverLog("stream.begin", {
+      userText,
+      prevCount: previousMessages.length,
+      images: images.length,
+      pdfs: pdfs.length,
+    });
+
     // ======= SHORT-CIRCUITS for USER input =======
 
     // (A) JSON triggers in USER message — with auto-summary
     const jsonUserTriggers = findJsonTriggersInText(userText);
     if (jsonUserTriggers.length) {
+      serverLog("json.user.detect", { triggers: jsonUserTriggers });
+
       let accumulated: Message[] = [...newMessagesArr];
+      let anyResults = false;
+      const successTrigs: AutoTrigger[] = [];
       for (const trig of jsonUserTriggers) {
         if (trig.kind === "wikipedia") {
+          serverLog("wikipedia.call", { q: trig.q, n: trig.n ?? 5, collection: trig.collection });
           const n = trig.n ?? 5;
           const collection =
             trig.collection ??
@@ -1163,9 +1244,12 @@ Use only the visible results as your basis.`;
           const out = (res || []).map((r: WikipediaResult, i: number) =>
             `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${(res || []).length}**\n**${chatIslandContent[lang].wikipediaTitle}**: ${r.Title}\n**${chatIslandContent[lang].wikipediaURL}**: ${r.URL}\n**${chatIslandContent[lang].wikipediaContent}**: ${r.content}\n**${chatIslandContent[lang].wikipediaScore}**: ${r.score}`
           ).join("\n\n");
-          accumulated = [...accumulated, { role: "assistant", content: out }];
+          serverLog("wikipedia.result", { length: out.length, empty: !out.trim() });
+          if (out.trim()) { anyResults = true; successTrigs.push(trig); }
+          accumulated = [...accumulated, { role: "assistant", content: out.trim() || (lang === "de" ? "Entschuldigung, die Suche hat keine Ergebnisse geliefert oder ist fehlgeschlagen." : "Sorry, the search returned no results or failed.") }];
           setMessages(accumulated); safePersist(accumulated, currentChatSuffix);
         } else if (trig.kind === "papers") {
+          serverLog("papers.call", { q: trig.q, n: trig.n ?? 5 });
           const limit = trig.n ?? 5;
           const res = await fetchPapers(trig.q, limit);
           const items = res?.payload?.items || [];
@@ -1179,32 +1263,42 @@ Use only the visible results as your basis.`;
             const doiLabel = "DOI";
             return `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${items.length}**\n**${T}**: ${it.title}\n**${A}**: ${authors}\n**${S}**: ${subjs}\n**${doiLabel}**: ${it.doi}\n**${AB}**: ${it.abstract}`;
           }).join("\n\n");
-          accumulated = [...accumulated, { role: "assistant", content: out }];
+          serverLog("papers.result", { length: out.length, empty: !out.trim() });
+          if (out.trim()) { anyResults = true; successTrigs.push(trig); }
+          accumulated = [...accumulated, { role: "assistant", content: out.trim() || (lang === "de" ? "Entschuldigung, die Suche hat keine Ergebnisse geliefert oder ist fehlgeschlagen." : "Sorry, the search returned no results or failed.") }];
           setMessages(accumulated); safePersist(accumulated, currentChatSuffix);
         } else if (trig.kind === "bildungsplan") {
+          serverLog("bildungsplan.call", { q: trig.q, n: trig.n ?? 5 });
           const top_n = trig.n ?? 5;
           const res = await fetchBildungsplan(trig.q, top_n);
           const results = res?.results || [];
           const out = results.map((r, i) =>
             `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${results.length}**\n${r.text}\n\n**Score**: ${r.score}`
           ).join("\n\n");
-          accumulated = [...accumulated, { role: "assistant", content: out }];
+          serverLog("bildungsplan.result", { length: out.length, empty: !out.trim() });
+          if (out.trim()) { anyResults = true; successTrigs.push(trig); }
+          accumulated = [...accumulated, { role: "assistant", content: out.trim() || (lang === "de" ? "Entschuldigung, die Suche hat keine Ergebnisse geliefert oder ist fehlgeschlagen." : "Sorry, the search returned no results or failed.") }];
           setMessages(accumulated); safePersist(accumulated, currentChatSuffix);
         }
       }
       setIsStreamComplete(true);
-      const summaryPrompt = buildAutoSummaryPrompt(jsonUserTriggers);
-      // Use the *accumulated* thread so the summary sees the results we just appended
-      startStream(summaryPrompt, accumulated);
+      serverLog("triggers.summary.maybe", { anyResults, successCount: successTrigs.length });
+      if (anyResults && successTrigs.length) {
+        const summaryPrompt = buildAutoSummaryPrompt(successTrigs);
+        startStream(summaryPrompt, accumulated);
+      }
       return;
     }
 
-    // (B) Legacy hashtags in USER message (no auto-summary)
+    // (B) Legacy hashtags in USER message
     const hashUserTriggers = findHashtagTriggersInUserText(userText);
     if (hashUserTriggers.length) {
+      serverLog("hashtag.user.detect", { triggers: hashUserTriggers });
+
       let accumulated: Message[] = [...newMessagesArr];
       for (const trig of hashUserTriggers) {
         if (trig.kind === "wikipedia") {
+          serverLog("wikipedia.call", { q: trig.q, n: trig.n ?? 5, collection: trig.collection });
           const n = trig.n ?? 5;
           const collection =
             trig.collection ??
@@ -1213,8 +1307,10 @@ Use only the visible results as your basis.`;
           const out = (res || []).map((r: WikipediaResult, i: number) =>
             `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${(res || []).length}**\n**${chatIslandContent[lang].wikipediaTitle}**: ${r.Title}\n**${chatIslandContent[lang].wikipediaURL}**: ${r.URL}\n**${chatIslandContent[lang].wikipediaContent}**: ${r.content}\n**${chatIslandContent[lang].wikipediaScore}**: ${r.score}`
           ).join("\n\n");
-          accumulated = [...accumulated, { role: "assistant", content: out }];
+          serverLog("wikipedia.result", { length: out.length, empty: !out.trim() });
+          accumulated = [...accumulated, { role: "assistant", content: out.trim() || (lang === "de" ? "Entschuldigung, die Suche hat keine Ergebnisse geliefert oder ist fehlgeschlagen." : "Sorry, the search returned no results or failed.") }];
         } else if (trig.kind === "papers") {
+          serverLog("papers.call", { q: trig.q, n: trig.n ?? 5 });
           const limit = trig.n ?? 5;
           const res = await fetchPapers(trig.q, limit);
           const items = res?.payload?.items || [];
@@ -1228,15 +1324,18 @@ Use only the visible results as your basis.`;
             const doiLabel = "DOI";
             return `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${items.length}**\n**${T}**: ${it.title}\n**${A}**: ${authors}\n**${S}**: ${subjs}\n**${doiLabel}**: ${it.doi}\n**${AB}**: ${it.abstract}`;
           }).join("\n\n");
-          accumulated = [...accumulated, { role: "assistant", content: out }];
+          serverLog("papers.result", { length: out.length, empty: !out.trim() });
+          accumulated = [...accumulated, { role: "assistant", content: out.trim() || (lang === "de" ? "Entschuldigung, die Suche hat keine Ergebnisse geliefert oder ist fehlgeschlagen." : "Sorry, the search returned no results or failed.") }];
         } else if (trig.kind === "bildungsplan") {
+          serverLog("bildungsplan.call", { q: trig.q, n: trig.n ?? 5 });
           const top_n = trig.n ?? 5;
           const res = await fetchBildungsplan(trig.q, top_n);
           const results = res?.results || [];
           const out = results.map((r, i) =>
             `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${results.length}**\n${r.text}\n\n**Score**: ${r.score}`
           ).join("\n\n");
-          accumulated = [...accumulated, { role: "assistant", content: out }];
+          serverLog("bildungsplan.result", { length: out.length, empty: !out.trim() });
+          accumulated = [...accumulated, { role: "assistant", content: out.trim() || (lang === "de" ? "Entschuldigung, die Suche hat keine Ergebnisse geliefert oder ist fehlgeschlagen." : "Sorry, the search returned no results or failed.") }];
         }
       }
       setMessages(accumulated); safePersist(accumulated, currentChatSuffix);
@@ -1245,42 +1344,40 @@ Use only the visible results as your basis.`;
     }
 
     // ======= Streaming path (LLM) =======
-    const assistantGroupIndex = newMessagesArr.length; // where assistant message would appear
-    const ongoingStream: string[] = []; // buffer for sentence-boundary TTS
+    let assistantDraftIndex = -1;
+    const ongoingStream: string[] = [];
     let currentAudioIndex = 1;
 
-    // For reliable auto-trigger: accumulate assistant text locally (after think-filter)
     let assistantAccum = "";
-    let autoTriggered = false;
-
-    // Lazy draft controls
-    let createdDraft: boolean = false;
     let gotAnyText = false;
 
-    // build a think filter instance for this stream
+    const seenTriggerKeys = new Set<string>();
+    let endFinalized = false;
+    let interruptedForTrigger = false;
+    let pendingInstreamTriggers: AutoTrigger[] = [];
+
     const filterThink = makeThinkFilter();
 
     const ensureDraft = () => {
-      if (!createdDraft) {
-        createdDraft = true;
-        setMessages((prev) => {
-          const next = [...prev, { role: "assistant", content: "" }];
-          safePersist(next, currentChatSuffix);
-          return next;
-        });
-      }
+      if (assistantDraftIndex !== -1) return;
+      setMessages((prev) => {
+        assistantDraftIndex = prev.length;
+        const next = [...prev, { role: "assistant", content: "" }];
+        safePersist(next, currentChatSuffix);
+        return next;
+      });
     };
 
     const appendToAssistant = (txt: string) => {
       if (!txt) return;
       setMessages((prev) => {
-        if (!createdDraft) {
-          createdDraft = true;
+        if (assistantDraftIndex === -1) {
+          assistantDraftIndex = prev.length;
           const next = [...prev, { role: "assistant", content: txt }];
           safePersist(next, currentChatSuffix);
           return next;
         }
-        const idx = prev.length - 1;
+        const idx = assistantDraftIndex;
         const last = prev[idx];
         const prevText =
           typeof last.content === "string"
@@ -1289,12 +1386,161 @@ Use only the visible results as your basis.`;
               ? (last.content as string[]).join("")
               : "";
         const updated = { ...last, content: prevText + txt };
-        const next = [...prev.slice(0, -1), updated];
-        // Throttle during streaming
+        const next = [...prev];
+        next[idx] = updated;
         safePersistThrottled(next, currentChatSuffix);
         return next;
       });
     };
+
+    const keyOf = (t: AutoTrigger) =>
+      `${t.kind}|${t.q}|${t.kind === "wikipedia" ? (t as any).collection ?? "" : ""}|${t.n ?? ""}`;
+
+    // Triggers ausführen und (nur bei Erfolg) später zusammenfassen
+    const handleTriggers = async (trigs: AutoTrigger[]): Promise<{ anyResults: boolean; accumulated: Message[]; successTrigs: AutoTrigger[] }> => {
+      if (!trigs.length) return { anyResults: false, accumulated: messagesRef.current, successTrigs: [] };
+
+      // Dedupe
+      const fresh: AutoTrigger[] = [];
+      for (const t of trigs) {
+        const k = keyOf(t);
+        if (!seenTriggerKeys.has(k)) {
+          seenTriggerKeys.add(k);
+          fresh.push(t);
+        }
+      }
+      if (!fresh.length) return { anyResults: false, accumulated: messagesRef.current, successTrigs: [] };
+
+      await serverLog("triggers.begin", { requested: trigs, deduped: fresh });
+
+      let accumulated: Message[] = messagesRef.current;
+      let anyResults = false;
+      const successTrigs: AutoTrigger[] = [];
+
+      for (const trig of fresh) {
+        if (trig.kind === "wikipedia") {
+          await serverLog("wikipedia.call", { q: trig.q, n: trig.n ?? 5, collection: trig.collection });
+          const n = trig.n ?? 5;
+          const collection =
+            trig.collection ??
+            (lang === "en" ? "English-ConcatX-Abstract" : "German-ConcatX-Abstract");
+          const res = await fetchWikipedia(trig.q, collection, n);
+          const out = (res || []).map((r: WikipediaResult, i: number) =>
+            `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${(res || []).length}**\n**${chatIslandContent[lang].wikipediaTitle}**: ${r.Title}\n**${chatIslandContent[lang].wikipediaURL}**: ${r.URL}\n**${chatIslandContent[lang].wikipediaContent}**: ${r.content}\n**${chatIslandContent[lang].wikipediaScore}**: ${r.score}`
+          ).join("\n\n");
+          await serverLog("wikipedia.result", { length: out.length, empty: !out.trim() });
+          if (out.trim()) { anyResults = true; successTrigs.push(trig); }
+          accumulated = [...accumulated, { role: "assistant", content: out.trim() || (lang === "de" ? "Entschuldigung, die Suche hat keine Ergebnisse geliefert oder ist fehlgeschlagen." : "Sorry, the search returned no results or failed.") }];
+          setMessages(accumulated); safePersist(accumulated, currentChatSuffix);
+        } else if (trig.kind === "papers") {
+          await serverLog("papers.call", { q: trig.q, n: trig.n ?? 5 });
+          const limit = trig.n ?? 5;
+          const res = await fetchPapers(trig.q, limit);
+          const items = res?.payload?.items || [];
+          const out = items.map((it: PapersItem, i: number) => {
+            const authors = it.authors?.join(", ") || "";
+            const subjs = it.subjects?.join(", ") || "";
+            const T = chatIslandContent[lang].papersTitle ?? "Title";
+            const A = chatIslandContent[lang].papersAuthors ?? "Authors";
+            const S = chatIslandContent[lang].papersSubjects ?? "Subjects";
+            const AB = chatIslandContent[lang].papersAbstract ?? "Abstract";
+            const doiLabel = "DOI";
+            return `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${items.length}**\n**${T}**: ${it.title}\n**${A}**: ${authors}\n**${S}**: ${subjs}\n**${doiLabel}**: ${it.doi}\n**${AB}**: ${it.abstract}`;
+          }).join("\n\n");
+          await serverLog("papers.result", { length: out.length, empty: !out.trim() });
+          if (out.trim()) { anyResults = true; successTrigs.push(trig); }
+          accumulated = [...accumulated, { role: "assistant", content: out.trim() || (lang === "de" ? "Entschuldigung, die Suche hat keine Ergebnisse geliefert oder ist fehlgeschlagen." : "Sorry, the search returned no results or failed.") }];
+          setMessages(accumulated); safePersist(accumulated, currentChatSuffix);
+        } else if (trig.kind === "bildungsplan") {
+          await serverLog("bildungsplan.call", { q: trig.q, n: trig.n ?? 5 });
+          const top_n = trig.n ?? 5;
+          const res = await fetchBildungsplan(trig.q, top_n);
+          const results = res?.results || [];
+          const out = results.map((r, i) =>
+            `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${results.length}**\n${r.text}\n\n**Score**: ${r.score}`
+          ).join("\n\n");
+          await serverLog("bildungsplan.result", { length: out.length, empty: !out.trim() });
+          if (out.trim()) { anyResults = true; successTrigs.push(trig); }
+          accumulated = [...accumulated, { role: "assistant", content: out.trim() || (lang === "de" ? "Entschuldigung, die Suche hat keine Ergebnisse geliefert oder ist fehlgeschlagen." : "Sorry, the search returned no results or failed.") }];
+          setMessages(accumulated); safePersist(accumulated, currentChatSuffix);
+        }
+      }
+
+      return { anyResults, accumulated, successTrigs };
+    };
+
+    // Zusammenfassung nach Triggern (nur bei Erfolg)
+    const runTriggersAndMaybeSummarize = async (trigs: AutoTrigger[]) => {
+      await serverLog("triggers.summary.maybe", { requested: trigs.length });
+      const { anyResults, accumulated, successTrigs } = await handleTriggers(trigs);
+      setIsStreamComplete(true);
+      await serverLog("triggers.summary.result", { anyResults, successCount: successTrigs.length });
+      if (anyResults && successTrigs.length) {
+        const summaryPrompt = buildAutoSummaryPrompt(successTrigs);
+        startStream(summaryPrompt, accumulated);
+      }
+    };
+
+    const finalizeStream = async () => {
+      if (endFinalized) return;
+      endFinalized = true;
+
+      setIsStreamComplete(true);
+      setQuery("");
+
+      const flushed = filterThink.flush();
+      if (flushed) {
+        appendToAssistant(flushed);
+        ongoingStream.push(flushed);
+        assistantAccum += flushed;
+      }
+
+      flushPersistThrottle();
+
+      if (!gotAnyText) {
+        setMessages((prev) => {
+          if (!prev.length) return prev;
+          const last = prev[assistantDraftIndex === -1 ? prev.length - 1 : assistantDraftIndex];
+          const txt =
+            typeof last?.content === "string"
+              ? last.content
+              : Array.isArray(last?.content)
+                ? (last.content as string[]).join("")
+                : "";
+          if (last?.role === "assistant" && (!txt || txt.trim() === "")) {
+            const next = [...prev];
+            next.splice(assistantDraftIndex === -1 ? prev.length - 1 : assistantDraftIndex, 1);
+            safePersist(next, currentChatSuffix);
+            return next;
+          }
+          return prev;
+        });
+      } else {
+        const remaining = ongoingStream.join("").trim();
+        if (remaining) {
+          const groupIndex = assistantDraftIndex === -1 ? messagesRef.current.length - 1 : assistantDraftIndex;
+          getTTS(remaining, groupIndex, `stream${currentAudioIndex}`);
+        }
+      }
+
+      // Nach regulärem Stream-Ende: Trigger (falls vorhanden) ausführen und ggf. zusammenfassen
+      const finalTriggers = findJsonTriggersInText(assistantAccum);
+      await serverLog("stream.finalize", { gotAnyText, assistantAccumLen: assistantAccum.length, triggersFound: finalTriggers.length });
+      if (finalTriggers.length) {
+        await serverLog("json.poststream.detect", { triggers: finalTriggers });
+        await runTriggersAndMaybeSummarize(finalTriggers);
+      }
+
+      abortRef.current = null;
+    };
+
+    await serverLog("sse.request", {
+      url: "/api/chat",
+      model: settings.apiModel,
+      apiUrl: settings.apiUrl,
+      images: images.length,
+      pdfs: pdfs.length,
+    });
 
     await fetchEventSource("/api/chat", {
       method: "POST",
@@ -1315,6 +1561,7 @@ Use only the visible results as your basis.`;
       signal: abortRef.current?.signal,
 
       async onopen(response: Response) {
+        await serverLog("sse.open", { ok: response.ok, status: response.status });
         if (response.ok) return;
         if (response.status !== 200) {
           const errorText = await response.text().catch(() => "");
@@ -1348,27 +1595,34 @@ Use only the visible results as your basis.`;
 
         let rawChunk = "";
         try {
-          rawChunk = JSON.parse(ev.data) as string; // server sends JSON.stringify(chunk)
+          rawChunk = JSON.parse(ev.data) as string;
         } catch {
           return;
         }
         if (!rawChunk) return;
 
-        // Filter THINK tokens incrementally (affects both UI and TTS)
+        // DEBUG: chunklen
+        serverLog("sse.chunk", { len: rawChunk.length });
+
+        // Early end marker
+        if (rawChunk === "[DONE]") {
+          setTimeout(() => abortRef.current?.abort(), 0);
+          finalizeStream();
+          return;
+        }
+
+        // THINK filter
         const chunk = filterThink.consume(rawChunk);
-        if (!chunk) return; // If entire piece was think-only, skip fully.
+        if (!chunk) return;
 
         gotAnyText = true;
         ensureDraft();
 
-        // accumulate *visible* text for triggers
         assistantAccum += chunk;
 
-        // Buffer for TTS by sentence
+        // TTS buffer
         ongoingStream.push(chunk);
         const combined = ongoingStream.join("");
-
-        // speak when we hit a sentence-end that's not a decimal number boundary
         const re = /(?<!\d)[.!?]/g;
         let lastIdx = -1, m: RegExpExecArray | null;
         while ((m = re.exec(combined)) !== null) lastIdx = m.index;
@@ -1377,18 +1631,44 @@ Use only the visible results as your basis.`;
           const toSpeak = combined.slice(0, split).trim();
           const remaining = combined.slice(split);
           if (toSpeak) {
-            getTTS(toSpeak, assistantGroupIndex, `stream${currentAudioIndex}`);
+            const groupIndex = assistantDraftIndex === -1 ? newMessagesArr.length : assistantDraftIndex;
+            getTTS(toSpeak, groupIndex, `stream${currentAudioIndex}`);
             currentAudioIndex++;
           }
           ongoingStream.length = 0;
           if (remaining.trim()) ongoingStream.push(remaining);
         }
 
-        // Append filtered chunk to assistant bubble
+        // Append to chat
         appendToAssistant(chunk);
+
+        // -------- HARTER In-Stream-Stop bei vollständigem JSON-Trigger ----------
+        if (chunk.includes("}")) {
+          const maybeTriggers = findJsonTriggersInText(assistantAccum);
+          const fresh: AutoTrigger[] = [];
+          for (const t of maybeTriggers) {
+            const k = keyOf(t);
+            if (!seenTriggerKeys.has(k)) fresh.push(t);
+          }
+          if (fresh.length) {
+            // DEBUG
+            serverLog("json.instream.detect", {
+              braceSeen: true,
+              accLen: assistantAccum.length,
+              triggers: fresh,
+            });
+
+            // Stop the stream *after* the closing brace is visible
+            interruptedForTrigger = true;
+            pendingInstreamTriggers = fresh;
+            setTimeout(() => abortRef.current?.abort(), 0);
+            return;
+          }
+        }
       },
 
-      onerror(err: FatalError) {
+      async onerror(err: FatalError) {
+        await serverLog("sse.error", { message: String(err?.message || err) });
         setIsStreamComplete(true);
         ensureDraft();
         appendToAssistant(`\n\n${String(err?.message || err)}`);
@@ -1396,118 +1676,15 @@ Use only the visible results as your basis.`;
       },
 
       onclose() {
-        setIsStreamComplete(true);
-        setQuery("");
-
-        // Flush any safe carry left in the think-filter
-        const flushed = filterThink.flush();
-        if (flushed) {
-          appendToAssistant(flushed);
-          ongoingStream.push(flushed);
-          assistantAccum += flushed;
+        serverLog("sse.close", { interruptedForTrigger });
+        // Wenn wir bewusst gestoppt haben, führe erst die Recherche aus und ggf. danach Zusammenfassung.
+        if (interruptedForTrigger) {
+          runTriggersAndMaybeSummarize(pendingInstreamTriggers);
+          abortRef.current = null;
+          return;
         }
-
-        // Ensure throttled persist is written now
-        flushPersistThrottle();
-
-        if (!gotAnyText) {
-          setMessages((prev) => {
-            if (!prev.length) return prev;
-            const last = prev[prev.length - 1];
-            const txt =
-              typeof last.content === "string"
-                ? last.content
-                : Array.isArray(last.content)
-                  ? (last.content as string[]).join("")
-                  : "";
-            if (last?.role === "assistant" && (!txt || txt.trim() === "")) {
-              const next = prev.slice(0, -1);
-              safePersist(next, currentChatSuffix);
-              return next; // drop empty
-            }
-            return prev;
-          });
-        } else {
-          const remaining = ongoingStream.join("").trim();
-          if (remaining) {
-            getTTS(remaining, assistantGroupIndex, `stream${currentAudioIndex}`);
-          }
-        }
-
-        // ---- Auto-trigger detection AFTER stream (JSON ONLY for assistant) ----
-        if (!autoTriggered && assistantAccum.trim()) {
-          // Only JSON triggers are considered here (assistant should output dicts)
-          const jsonTriggers = findJsonTriggersInText(assistantAccum);
-
-          // Deduplicate by (kind+q+collection?)
-          const keyOf = (t: AutoTrigger) =>
-            `${t.kind}|${t.q}|${t.kind === "wikipedia" ? (t as any).collection ?? "" : ""}|${t.n ?? ""}`;
-          const seen = new Set<string>();
-          const allTriggers: AutoTrigger[] = [];
-          jsonTriggers.forEach((t) => {
-            const k = keyOf(t);
-            if (!seen.has(k)) { seen.add(k); allTriggers.push(t); }
-          });
-
-          if (allTriggers.length) {
-            autoTriggered = true;
-            (async () => {
-              let accumulated: Message[] = messagesRef.current;
-              let wantSummary = false;
-              const summaryTrigs: AutoTrigger[] = [];
-
-              for (const trig of allTriggers) {
-                if (trig.kind === "wikipedia") {
-                  const n = trig.n ?? 5;
-                  const collection =
-                    trig.collection ??
-                    (lang === "en" ? "English-ConcatX-Abstract" : "German-ConcatX-Abstract");
-                  const res = await fetchWikipedia(trig.q, collection, n);
-                  const out = (res || []).map((r: WikipediaResult, i: number) =>
-                    `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${(res || []).length}**\n**${chatIslandContent[lang].wikipediaTitle}**: ${r.Title}\n**${chatIslandContent[lang].wikipediaURL}**: ${r.URL}\n**${chatIslandContent[lang].wikipediaContent}**: ${r.content}\n**${chatIslandContent[lang].wikipediaScore}**: ${r.score}`
-                  ).join("\n\n");
-                  accumulated = [...accumulated, { role: "assistant", content: out }];
-                  setMessages(accumulated); safePersist(accumulated, currentChatSuffix);
-                  if (trig.autoSummarize) { wantSummary = true; summaryTrigs.push(trig); }
-                } else if (trig.kind === "papers") {
-                  const limit = trig.n ?? 5;
-                  const res = await fetchPapers(trig.q, limit);
-                  const items = res?.payload?.items || [];
-                  const out = items.map((it: PapersItem, i: number) => {
-                    const authors = it.authors?.join(", ") || "";
-                    const subjs = it.subjects?.join(", ") || "";
-                    const T = chatIslandContent[lang].papersTitle ?? "Title";
-                    const A = chatIslandContent[lang].papersAuthors ?? "Authors";
-                    const S = chatIslandContent[lang].papersSubjects ?? "Subjects";
-                    const AB = chatIslandContent[lang].papersAbstract ?? "Abstract";
-                    const doiLabel = "DOI";
-                    return `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${items.length}**\n**${T}**: ${it.title}\n**${A}**: ${authors}\n**${S}**: ${subjs}\n**${doiLabel}**: ${it.doi}\n**${AB}**: ${it.abstract}`;
-                  }).join("\n\n");
-                  accumulated = [...accumulated, { role: "assistant", content: out }];
-                  setMessages(accumulated); safePersist(accumulated, currentChatSuffix);
-                  if (trig.autoSummarize) { wantSummary = true; summaryTrigs.push(trig); }
-                } else if (trig.kind === "bildungsplan") {
-                  const top_n = trig.n ?? 5;
-                  const res = await fetchBildungsplan(trig.q, top_n);
-                  const results = res?.results || [];
-                  const out = results.map((r, i) =>
-                    `**${chatIslandContent[lang].result} ${i + 1} ${chatIslandContent[lang].of} ${results.length}**\n${r.text}\n\n**Score**: ${r.score}`
-                  ).join("\n\n");
-                  accumulated = [...accumulated, { role: "assistant", content: out }];
-                  setMessages(accumulated); safePersist(accumulated, currentChatSuffix);
-                  if (trig.autoSummarize) { wantSummary = true; summaryTrigs.push(trig); }
-                }
-              }
-
-              if (wantSummary && summaryTrigs.length) {
-                const summaryPrompt = buildAutoSummaryPrompt(summaryTrigs);
-                startStream(summaryPrompt, accumulated);
-              }
-            })();
-          }
-        }
-
-        abortRef.current = null;
+        // Sonst normal finalisieren
+        finalizeStream();
       },
     });
   };
@@ -1521,7 +1698,6 @@ Use only the visible results as your basis.`;
     // Only return early if readAlways is false AND this is a *pure streaming* request (not manual)
     if (!readAlways && /^stream\d+$/.test(sourceFunction)) return;
 
-    // Clean text for TTS (remove asterisks + emojis) but keep original for equality checks
     const ttsText = cleanForTTS(text);
 
     if (text === chatIslandContent[lang]["welcomeMessage"]) {
@@ -1536,15 +1712,12 @@ Use only the visible results as your basis.`;
       setAudioFileDict((prev) => {
         const next = { ...prev };
         const group = { ...(next[groupIndex] || {}) };
-        group[sourceFunctionIndex] = {
-          audio: audio,
-          played: false,
-        };
+        group[sourceFunctionIndex] = { audio, played: false };
         next[groupIndex] = group;
         return next;
       });
 
-      // pause all other groups
+      // pause other groups
       const newStopList = stopList.slice();
       for (let i = 0; i < groupIndex; i++) {
         const g = audioFileDict[i];
@@ -1563,14 +1736,12 @@ Use only the visible results as your basis.`;
       return;
     }
 
-    // Queue the TTS fetch into the small pool
+    // Queue the TTS fetch
     scheduleTTSJob(async () => {
       try {
         const response = await fetch("/api/tts", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             text: ttsText,
             textPosition: sourceFunction,
@@ -1591,7 +1762,7 @@ Use only the visible results as your basis.`;
         const audioBlob = new Blob([audioData], { type: contentType });
         const audioUrl = URL.createObjectURL(audioBlob);
         const audio = new Audio(audioUrl) as HTMLAudioElement & { __text?: string };
-        audio.__text = text; // keep original (with stars/emojis) for regen checks
+        audio.__text = text;
 
         // ensure group slot
         const idx = indexFromSourceFunction(sourceFunction);
@@ -1656,7 +1827,7 @@ Use only the visible results as your basis.`;
         });
       },
     );
-    setAudioFileDict({}); // clear old audios
+    setAudioFileDict({});
   };
 
   // ---------- Chat management ----------
@@ -1667,10 +1838,7 @@ Use only the visible results as your basis.`;
     const newChatSuffix = String(Number(maxValueInChatSuffix) + 1);
 
     const welcome = [
-      {
-        role: "assistant",
-        content: [chatIslandContent[lang]["welcomeMessage"]],
-      },
+      { role: "assistant", content: [chatIslandContent[lang]["welcomeMessage"]] },
     ] as Message[];
 
     setMessages(welcome);
@@ -1696,10 +1864,7 @@ Use only the visible results as your basis.`;
       setCurrentChatSuffix(nextChatSuffix);
     } else {
       const welcome = [
-        {
-          role: "assistant",
-          content: [chatIslandContent[lang]["welcomeMessage"]],
-        },
+        { role: "assistant", content: [chatIslandContent[lang]["welcomeMessage"]] },
       ] as Message[];
       setMessages(welcome);
       safePersist(welcome, "0");
@@ -1710,10 +1875,7 @@ Use only the visible results as your basis.`;
   const deleteAllChats = () => {
     localStorage.clear();
     const welcome = [
-      {
-        role: "assistant",
-        content: [chatIslandContent[lang]["welcomeMessage"]],
-      },
+      { role: "assistant", content: [chatIslandContent[lang]["welcomeMessage"]] },
     ] as Message[];
     setMessages(welcome);
     setLocalStorageKeys([]);
