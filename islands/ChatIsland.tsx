@@ -769,8 +769,8 @@ export default function ChatIsland({ lang }: { lang: string }) {
   `Bitte fasse die oben angezeigten Suchergebnisse (${topics}) pr\u00E4gnant zusammen:
   - Nenne die Kernaussagen in klaren Stichpunkten.
   - Hebe ggf. Relevanz f\u00FCr Unterricht/Kontext hervor.
-  - F\u00FCge am Ende 3\u20135 kurze Bulletpoints mit Quellen/URLs aus den gezeigten Ergebnissen an.
-  Nutze nur die sichtbaren Ergebnisse als Grundlage.`
+  - F\u00FCge am Ende 3\u20135 kurze Bulletpoints mit Quellen/URLs und falls vorhanden auch Setienangaben aus den gezeigten Ergebnissen an.
+  Sei absolut faktengetreu und nutze nur die sichtbaren Ergebnisse als Grundlage.`
       );
     }
 
@@ -779,7 +779,7 @@ export default function ChatIsland({ lang }: { lang: string }) {
   `Please summarize the search results shown above (${topics}) concisely:
   - Provide key takeaways in clear bullet points.
   - Highlight relevance to the user's context if applicable.
-  - Add 3\u20135 short bullets with sources/URLs from the shown results.
+  - Add 3\u20135 short bullets with sources/URLs and if available also page numbers from the shown results. Be absolutely factual-
   Use only the visible results as your basis.`
     );
   };
