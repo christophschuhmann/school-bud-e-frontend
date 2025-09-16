@@ -104,8 +104,12 @@ export default function ChatIsland({ lang }: { lang: string }) {
   // dictionary containing audio files for each groupIndex for the current chat
   const [audioFileDict, setAudioFileDict] = useState<AudioFileDict>({});
 
+
+  const playSessionRef = useRef(0);
+
   // used for STT in VoiceRecordButton
   const [resetTranscript, setResetTranscript] = useState(0);
+
 
   // General settings
   const [readAlways, setReadAlways] = useState(false);
@@ -406,9 +410,21 @@ export default function ChatIsland({ lang }: { lang: string }) {
     stopList_: number[],
   ): boolean => {
     if (stopList_.includes(Number(groupIndex))) return false;
-    const previousAudio = groupAudios[audioIndex - 1];
-    return audioIndex === 0 || (previousAudio?.played && previousAudio?.audio.paused);
+
+    // Never start a new clip if any clip in this group is currently playing.
+    const anyPlaying = Object.values(groupAudios).some(
+      (it) => !it.audio.paused && !it.audio.ended
+    );
+    if (anyPlaying) return false;
+
+    // First clip: only start when nothing else is playing (handled above).
+    if (audioIndex === 0) return true;
+
+    // For subsequent clips, require the immediate predecessor to have actually ENDED.
+    const prev = groupAudios[audioIndex - 1];
+    return !!prev && prev.played && prev.audio.ended === true;
   };
+
 
   const playAudio = async (audio: HTMLAudioElement, groupIndex: number, audioIndex: number) => {
     try {
@@ -513,36 +529,47 @@ export default function ChatIsland({ lang }: { lang: string }) {
     first.play().catch((err) => console.warn("Audio play() rejected on start:", err));
   };
 
-  // connect manual chunks to their neighbors as they arrive (so late arrivals still chain)
+  // REPLACE the whole function:
   const wireNeighborChaining = (groupIndex: number, idx: number) => {
-    const prev = audioFileDict[groupIndex]?.[idx - 1]?.audio;
-    const curr = audioFileDict[groupIndex]?.[idx]?.audio;
-    if (!curr) return;
+    const group = audioFileDict[groupIndex] || {};
+    const prevEl = group[idx - 1]?.audio;
+    const currEl = group[idx]?.audio;
+    if (!currEl) return;
 
-    if (prev) {
-      prev.onended = () => {
-        const next = audioFileDict[groupIndex]?.[idx]?.audio;
-        if (next) {
-          next.play().catch((err) => console.warn("Audio play() rejected in chain:", err));
-        }
-        setAudioFileDict((p) => ({ ...p }));
+    const session = playSessionRef.current;
+
+    // Always clean up this blob after this element ends + mark played is already added in getTTS
+    const src = currEl.src;
+    currEl.addEventListener(
+      "ended",
+      () => {
+        try { if (src && src.startsWith("blob:")) URL.revokeObjectURL(src); } catch {}
+      },
+      { once: true },
+    );
+
+    // If readAlways is ON, the useEffect orchestrates sequential playback.
+    // Only install event-chaining for MANUAL speak (readAlways === false).
+    if (readAlways) return;
+
+    // Chain only if both prev and current belong to THIS session
+    if (prevEl && (prevEl as any).__session === (currEl as any).__session) {
+      const playNextOnce = () => {
+        // Ignore if another regenerate started
+        if (session !== playSessionRef.current) return;
+        currEl.play().catch((err) =>
+          console.warn("Audio play() rejected in chain:", err),
+        );
       };
+      prevEl.addEventListener("ended", playNextOnce, { once: true });
 
-      const prevItem = audioFileDict[groupIndex][idx - 1];
-      if (prevItem?.played && prevItem.audio.paused && !stopList.includes(groupIndex)) {
-        curr.play().catch((err) => console.warn("Audio play() rejected (prev-ended):", err));
+      // Manual fast-path: if prev already finished when current arrives
+      if ((prevEl as any).ended && !stopList.includes(groupIndex)) {
+        currEl.play().catch((err) =>
+          console.warn("Audio play() rejected (prev already ended):", err),
+        );
       }
     }
-
-    // clean up blob URL after play ends
-    const src = curr.src;
-    curr.onended = (() => {
-      const old = curr.onended;
-      return () => {
-        try { if (src?.startsWith("blob:")) URL.revokeObjectURL(src); } catch {}
-        if (old) old.call(curr);
-      };
-    })();
   };
 
   // ---------- Trigger helpers (legacy hashtags for USER only) ----------
@@ -784,14 +811,34 @@ export default function ChatIsland({ lang }: { lang: string }) {
     );
   };
 
+  const clearGroupAudio = (gi: number) => {
+    const group = audioFileDict[gi];
+    if (!group) return;
+    Object.values(group).forEach(({ audio }) => {
+      try { audio.pause(); audio.currentTime = 0; } catch {}
+      try { if (audio.src?.startsWith("blob:")) URL.revokeObjectURL(audio.src); } catch {}
+      audio.onended = null;
+      audio.src = "";
+    });
+    setAudioFileDict((prev) => {
+      const next = { ...prev };
+      delete next[gi];
+      return next;
+    });
+  };
+
   // ---------- Chat list actions ----------
   const handleRefreshAction = (groupIndex: number) => {
     if (!(groupIndex >= 0 && groupIndex < messages.length)) return;
 
+    
     // Cancel any running stream
     abortRef.current?.abort();
     abortRef.current = null;
     setIsStreamComplete(true);
+
+    playSessionRef.current += 1;
+    stopAndResetAudio();
 
     // We want to re-run from this assistant turn’s *preceding user* turn (if present)
     let sliceStart = groupIndex;
@@ -800,6 +847,12 @@ export default function ChatIsland({ lang }: { lang: string }) {
     }
 
     const prev = messages.slice(0, sliceStart) as Message[];
+
+
+    // NEW: isolate this run and nuke stale audio ONLY for the upcoming assistant group
+    const upcomingAssistantGroup = prev.length;
+    playSessionRef.current += 1;
+    clearGroupAudio(upcomingAssistantGroup);
 
     // Extract the most recent user text to re-send
     const userMsg = messages[sliceStart];
@@ -1704,8 +1757,10 @@ export default function ChatIsland({ lang }: { lang: string }) {
       const audioFile = text === chatIslandContent["de"]["welcomeMessage"]
         ? "./intro.mp3"
         : "./intro-en.mp3";
-      const audio = new Audio(audioFile) as HTMLAudioElement & { __text?: string };
+
+      const audio = new Audio(audioUrl) as HTMLAudioElement & { __text?: string; __session?: number };
       audio.__text = text;
+      audio.__session = playSessionRef.current;   // NEW
 
       const sourceFunctionIndex = indexFromSourceFunction(sourceFunction);
 
@@ -1817,17 +1872,26 @@ export default function ChatIsland({ lang }: { lang: string }) {
   };
 
   const stopAndResetAudio = () => {
-    (Object.values(audioFileDict) as Record<number, AudioItem>[]).forEach(
-      (group) => {
-        (Object.values(group) as AudioItem[]).forEach((item: AudioItem) => {
-          if (!item.audio.paused) {
-            item.audio.pause();
-            item.audio.currentTime = 0;
-          }
+    try {
+      Object.values(audioFileDict as any).forEach((group: any) => {
+        Object.values(group || {}).forEach((item: any) => {
+          const a: HTMLAudioElement | undefined = item?.audio;
+          if (!a) return;
+          try { a.pause(); } catch {}
+          try { a.currentTime = 0; } catch {}
+          try {
+            const src = a.src;
+            if (src && src.startsWith("blob:")) URL.revokeObjectURL(src);
+          } catch {}
+          a.onended = null;
+          a.src = ""; // detach source so it can't re-fire
         });
-      },
-    );
+      });
+    } catch {}
     setAudioFileDict({});
+    setStopList([]);
+    // only if this exists in your component:
+    // setPendingManualSpeak(new Set());
   };
 
   // ---------- Chat management ----------
