@@ -10,6 +10,8 @@ const API_IMAGE_URL = Deno.env.get("VLM_URL") || "";
 const API_IMAGE_KEY = Deno.env.get("VLM_KEY") || "";
 const API_IMAGE_MODEL = Deno.env.get("VLM_MODEL") || "";
 const API_IMAGE_CORRECTION_MODEL = Deno.env.get("VLM_CORRECTION_MODEL") || "";
+const MIDDLEWARE_BASE_URL = Deno.env.get("MIDDLEWARE_URL") || "";
+
 
 interface Message {
   role: string;
