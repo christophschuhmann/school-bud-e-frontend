@@ -10,7 +10,6 @@ const API_IMAGE_URL = Deno.env.get("VLM_URL") || "";
 const API_IMAGE_KEY = Deno.env.get("VLM_KEY") || "";
 const API_IMAGE_MODEL = Deno.env.get("VLM_MODEL") || "";
 const API_IMAGE_CORRECTION_MODEL = Deno.env.get("VLM_CORRECTION_MODEL") || "";
-const MIDDLEWARE_BASE_URL = (Deno.env.get("MIDDLEWARE_URL") || "").replace(/\/+$/, "");
 
 interface Message {
   role: string;
@@ -32,6 +31,7 @@ function extractAssistantText(anyJson: any): string {
     }
   } catch (_) {}
   try {
+    // Gemini shape
     const cands = anyJson?.candidates ?? [];
     if (cands.length) {
       const parts = cands[0]?.content?.parts ?? [];
@@ -48,7 +48,11 @@ function extractAssistantText(anyJson: any): string {
   return "";
 }
 
-/** Minimal OpenAI-style SSE from a plain text (for non-stream fallbacks) */
+/** Turn plain text into a minimal OpenAI-style SSE stream for our UI
+ *  NOTE: Wenn kein Text vorhanden ist, senden wir KEIN roles-Delta,
+ *  sondern ein eigenes Event 'no_content', damit die UI keinen leeren
+ *  Assistenten-Ballon rendert.
+ */
 function sseFromText(text: string): ReadableStream<Uint8Array> {
   const enc = new TextEncoder();
   if (!text || !text.length) {
@@ -80,9 +84,11 @@ function hasKorrekturHashtag(messages: any[]): boolean {
   if (!messages || messages.length === 0) return false;
   const last = messages[messages.length - 1];
   if (!last || !last.content) return false;
+
   let content = "";
-  if (typeof last.content === "string") content = last.content;
-  else if (Array.isArray(last.content)) {
+  if (typeof last.content === "string") {
+    content = last.content;
+  } else if (Array.isArray(last.content)) {
     const textContent = last.content.find((it: any) => it.type === "text");
     content = textContent?.text || "";
   }
@@ -90,18 +96,7 @@ function hasKorrekturHashtag(messages: any[]): boolean {
   return content.includes("#korrektur") || content.includes("#correction");
 }
 
-/** Simple heuristic: which Gemini models allow reasoning/thinking? */
-function geminiSupportsThinking(model: string): boolean {
-  const m = (model || "").toLowerCase();
-  // exclude flash variants; allow pro-style models
-  if (m.includes("flash")) return false;
-  if (m.includes("pro")) return true;
-  return false;
-}
-
-// -----------------------------------------------------------------------------
-// Core: build the upstream call and stream it back
-// -----------------------------------------------------------------------------// --- REPLACE THE WHOLE FUNCTION STARTING HERE ---
+// --- REPLACE THE WHOLE FUNCTION STARTING HERE ---
 async function getModelResponseStream(
   messages: Message[],
   lang: string,
@@ -114,28 +109,19 @@ async function getModelResponseStream(
   vlmApiKey: string,
   vlmApiModel: string,
   vlmCorrectionModel: string,
-  wantsStream: boolean | undefined,
+  wantsStream: boolean | undefined, // NEW
 ) {
-  // 0) Resolve middleware URL robustly (env override, then fallback to your IP)
-  const resolvedMiddlewareBase =
-    (Deno.env.get("MIDDLEWARE_URL") || "").replace(/\/+$/, "") ||
-    "http://65.109.157.234:8787"; // <-- your previous working host
+  const MIDDLEWARE_BASE_URL = "http://65.109.157.234:8787";
 
-  // If a universal key is provided, override URLs to the middleware (OpenAI-compatible).
+  // If a universal key is provided, override URLs to the middleware.
   if (universalApiKey) {
-    if (!resolvedMiddlewareBase) {
-      return new Response(
-        "Universal key present, but MIDDLEWARE_URL is empty and no fallback was provided.",
-        { status: 400 },
-      );
-    }
-    llmApiUrl = `${resolvedMiddlewareBase}/v1/chat/completions`;
-    vlmApiUrl = `${resolvedMiddlewareBase}/v1/chat/completions`;
+    llmApiUrl = `${MIDDLEWARE_BASE_URL}/v1/chat/completions`;
+    vlmApiUrl = `${MIDDLEWARE_BASE_URL}/v1/chat/completions`;
     llmApiKey = universalApiKey;
     vlmApiKey = universalApiKey;
   }
 
-  // 1) Universal key format check (your rule)
+  // 1) Universal key format check
   if (universalApiKey !== "" && !universalApiKey.toLowerCase().startsWith("sbe-")) {
     return new Response("Invalid Universal API Key. It needs to start with 'sbe-'.", { status: 400 });
   }
@@ -165,15 +151,12 @@ async function getModelResponseStream(
     (m) => Array.isArray(m.content) && m.content.some((p: any) => p.type === "pdf"),
   );
 
-  // 6) If NO universal key and a PDF is present ? direct Gemini (unchanged)
+  // 6) Direct PDF → Gemini only when NO universal key (otherwise middleware handles PDFs)
   if (isPdfInMessages && !(universalApiKey && universalApiKey.trim().length > 0)) {
     const geminiApiKey = vlmApiKey || Deno.env.get("VLM_KEY") || "";
     const geminiModel = vlmApiModel || Deno.env.get("VLM_MODEL") || "gemini-2.5-pro";
     if (!geminiApiKey) {
-      return new Response(
-        "Missing VLM API key for PDF processing (expected Google AI Studio key).",
-        { status: 400 },
-      );
+      return new Response("Missing VLM API key for PDF processing (expected Google AI Studio key).", { status: 400 });
     }
 
     const systemMessage = messages.find((m) => m.role === "system");
@@ -208,7 +191,7 @@ async function getModelResponseStream(
             } else if (c.type === "image_url" && c.image_url?.url?.startsWith("data:")) {
               const dataUrl = c.image_url.url;
               const commaIdx = dataUrl.indexOf(",");
-              const header = dataUrl.substring(5, commaIdx);
+              const header = dataUrl.substring(5, commaIdx); // e.g. image/png;base64
               const base64 = dataUrl.substring(commaIdx + 1);
               const mimeType = header.split(";")[0];
               parts.push({ inlineData: { mimeType, data: base64 } });
@@ -218,8 +201,6 @@ async function getModelResponseStream(
         return { role: m.role === "assistant" ? "model" : "user", parts };
       });
 
-    // Keep your streaming vs non-stream branches exactly as before:
-    // (unchanged body below this point to avoid regressions)
     if (wantsStream !== false) {
       const geminiUrl =
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}` +
@@ -227,7 +208,6 @@ async function getModelResponseStream(
 
       const geminiBody: any = {
         contents: geminiContents,
-        // thinkingConfig is fine for pro models; Gemini will ignore if not supported.
         generationConfig: { thinkingConfig: { thinkingBudget: -1 } },
         tools: [{ googleSearch: {} }],
         ...(systemInstruction ? { systemInstruction } : {}),
@@ -251,7 +231,10 @@ async function getModelResponseStream(
             let sentAny = false;
             const finish = () => {
               if (closed) return;
-              if (!sentAny) controller.enqueue({ event: "no_content", data: "{}", id: Date.now() });
+              // Wenn kein Text kam: no_content signalisieren
+              if (!sentAny) {
+                controller.enqueue({ event: "no_content", data: "{}", id: Date.now() });
+              }
               closed = true;
               controller.close();
             };
@@ -341,6 +324,7 @@ async function getModelResponseStream(
             }
           },
           cancel(err) {
+            // Silence normal closures; log only unexpected ones.
             const s = String(err || "").toLowerCase();
             if (err && !s.includes("resource closed") && !s.includes("aborterror")) {
               console.warn("SSE canceled:", err);
@@ -359,11 +343,7 @@ async function getModelResponseStream(
         tools: [{ googleSearch: {} }],
         ...(systemInstruction ? { systemInstruction } : {}),
       };
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const txt = await r.text();
       return new Response(txt, {
         status: r.status,
@@ -372,7 +352,7 @@ async function getModelResponseStream(
     }
   }
 
-  // 7) LLM / VLM (no PDF) or Universal key present ? go upstream (middleware or direct)
+  // 7) LLM/VLM (no PDF) → upstream (middleware or direct)
   let useApiUrl = llmApiUrl || Deno.env.get("LLM_URL") || API_URL;
   let useApiKey = llmApiKey || Deno.env.get("LLM_KEY") || API_KEY;
   let useApiModel = llmApiModel || Deno.env.get("LLM_MODEL") || API_MODEL;
@@ -401,7 +381,7 @@ async function getModelResponseStream(
     });
   }
 
-  // Stream: request SSE and forward (add include_usage hint; otherwise unchanged)
+  // Stream: request SSE and forward
   return new Response(
     new ReadableStream({
       async start(controller) {
@@ -409,7 +389,9 @@ async function getModelResponseStream(
         let sentAny = false;
         const finish = () => {
           if (closed) return;
-          if (!sentAny) controller.enqueue({ event: "no_content", data: "{}", id: Date.now() });
+          if (!sentAny) {
+            controller.enqueue({ event: "no_content", data: "{}", id: Date.now() });
+          }
           closed = true;
           controller.close();
         };
@@ -418,12 +400,7 @@ async function getModelResponseStream(
           const upstream = await fetch(useApiUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: `Bearer ${useApiKey}` },
-            body: JSON.stringify({
-              model: useApiModel,
-              stream: true,
-              stream_options: { include_usage: true }, // harmless hint for middleware
-              messages,
-            }),
+            body: JSON.stringify({ model: useApiModel, stream: true, messages }),
           });
 
           if (!upstream.ok || !upstream.body) {
@@ -503,7 +480,7 @@ async function getModelResponseStream(
             }
             finish();
           } else {
-            // Non-SSE fallback ? convert JSON to mini-SSE
+            // Non-SSE fallback → convert JSON to mini-SSE
             const raw = await upstream.text();
             let text = "";
             try {
@@ -516,8 +493,13 @@ async function getModelResponseStream(
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
+              // sseFromText sendet bei leerem Text 'event: no_content'
+              // und bei nicht-leerem Text role+content.
               controller.enqueue(value);
               if (!sentAny) {
+                // Heuristik: sobald irgendein content-Frame kam, markiere sentAny
+                // (role-Delta kommt nur wenn Text existiert).
+                // Wir setzen sentAny true, wenn der Chunk einen content trägt.
                 try {
                   const s = new TextDecoder().decode(value);
                   if (s.includes('"content"')) sentAny = true;
@@ -551,8 +533,10 @@ async function getModelResponseStream(
     { headers: { "Content-Type": "text/event-stream" } },
   );
 }
+// --- REPLACE THE WHOLE FUNCTION ENDING HERE ---
 
 export const handler: Handlers = {
+  // Canonical entry: POST with JSON payload
   async POST(req: Request) {
     const payload = await req.json();
     const wantsStream: boolean | undefined = payload.stream;
@@ -560,19 +544,15 @@ export const handler: Handlers = {
       payload.messages as Message[],
       payload.lang,
       payload.universalApiKey,
-      payload.llmApiUrl,
-      payload.llmApiKey,
-      payload.llmApiModel,
+      payload.llmApiUrl, payload.llmApiKey, payload.llmApiModel,
       payload.systemPrompt,
-      payload.vlmApiUrl,
-      payload.vlmApiKey,
-      payload.vlmApiModel,
-      payload.vlmCorrectionModel,
+      payload.vlmApiUrl, payload.vlmApiKey, payload.vlmApiModel, payload.vlmCorrectionModel,
       wantsStream,
     );
   },
 
-  // GET with ?payload=<base64(json)> helper (unchanged).
+  // Allow GET (some clients/openers use EventSource or trigger GET accidentally)
+  // Accepts ?payload=<base64(json)> — if missing/invalid, return SSE error with guidance.
   async GET(req: Request) {
     const url = new URL(req.url);
     const payloadParam = url.searchParams.get("payload");
@@ -593,6 +573,7 @@ export const handler: Handlers = {
       });
       return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
     }
+
     let payload: any;
     try {
       const jsonStr = atob(payloadParam);
@@ -614,23 +595,20 @@ export const handler: Handlers = {
       });
       return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
     }
+
     const wantsStream: boolean | undefined = payload.stream;
     return getModelResponseStream(
       payload.messages as Message[],
       payload.lang,
       payload.universalApiKey,
-      payload.llmApiUrl,
-      payload.llmApiKey,
-      payload.llmApiModel,
+      payload.llmApiUrl, payload.llmApiKey, payload.llmApiModel,
       payload.systemPrompt,
-      payload.vlmApiUrl,
-      payload.vlmApiKey,
-      payload.vlmApiModel,
-      payload.vlmCorrectionModel,
+      payload.vlmApiUrl, payload.vlmApiKey, payload.vlmApiModel, payload.vlmCorrectionModel,
       wantsStream,
     );
   },
 
+  // Handle preflight cleanly to avoid 405 on OPTIONS
   async OPTIONS(_req: Request) {
     return new Response(null, {
       status: 204,
