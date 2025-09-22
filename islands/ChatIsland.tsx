@@ -1252,9 +1252,33 @@ export default function ChatIsland({ lang }: { lang: string }) {
     });
 
     const contentPayload: any[] = [{ type: "text", text: userText }];
-    if (images.length > 0) for (const img of images) contentPayload.push(img);
-    if (pdfs.length > 0) for (const pdf of pdfs) contentPayload.push(pdf);
 
+    // images are already OpenAI-compatible (image_url parts)
+    if (images.length > 0) {
+      for (const img of images) contentPayload.push(img);
+    }
+
+    /**
+    * IMPORTANT:
+    * If a Universal API key is present, forward PDFs in OpenAI-compatible shape:
+    *   { type: "input_file", mime_type: "application/pdf", data: "<base64>" }
+    * Otherwise keep the existing { type: "pdf", ... } shape (used by Gemini direct).
+    */
+    const usingUniversal = !!settings.universalApiKey;
+    if (pdfs.length > 0) {
+      if (usingUniversal) {
+        for (const pdf of pdfs) {
+          contentPayload.push({
+            type: "input_file",
+            mime_type: pdf.mime_type || "application/pdf",
+            data: pdf.data,             // base64 (we already store it like this)
+          });
+        }
+      } else {
+        for (const pdf of pdfs) contentPayload.push(pdf); // unchanged for direct Gemini
+      }
+    }
+     
     const newMessagesArr: Message[] = [
       ...previousMessages,
       { role: "user", content: contentPayload },
